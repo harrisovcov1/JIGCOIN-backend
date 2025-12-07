@@ -364,6 +364,25 @@ function buildClientState(user, extra = {}) {
 // ----------------- Telegram Bot Logic -----------------
 
 // /start handler with optional referral code
+// Mini app URL used in all bot replies
+const webAppUrl = "https://resilient-kheer-041b8c.netlify.app";
+
+function sendOpenAppReply(ctx, text) {
+  return ctx.reply(text, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "🚀 Open Airdrop Empire",
+            web_app: { url: webAppUrl },
+          },
+        ],
+      ],
+    },
+  });
+}
+
+// /start handler with optional referral code
 bot.start(async (ctx) => {
   const tgUser = ctx.from;
   const payload = (ctx.startPayload || "").trim(); // referral code if any
@@ -372,28 +391,74 @@ bot.start(async (ctx) => {
     let user = await getOrCreateUser(tgUser, payload || null);
     user = await refreshDailyState(user);
 
-    const webAppUrl = "https://peppy-lebkuchen-336af3.netlify.app";
-
-    await ctx.reply(
-      "🔥 Welcome to Airdrop Empire!\nTap below to open the game 👇",
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "🚀 Open Airdrop Empire",
-                web_app: { url: webAppUrl },
-              },
-            ],
-          ],
-        },
-      }
+    return sendOpenAppReply(
+      ctx,
+      "🔥 Welcome to Airdrop Empire!\nTap below to open the game 👇"
     );
   } catch (err) {
     console.error("Error in /start:", err);
     await ctx.reply("Something went wrong. Please try again in a moment.");
   }
 });
+
+// Additional commands so every command in the bot menu responds
+
+// /tap – explain tapping is in the mini app
+bot.command("tap", (ctx) => {
+  return sendOpenAppReply(
+    ctx,
+    "⚡ All tapping happens inside the Airdrop Empire mini app.\nTap below to open it 👇"
+  );
+});
+
+// /daily – daily check-in info
+bot.command("daily", (ctx) => {
+  return sendOpenAppReply(
+    ctx,
+    "🎁 Daily check-in lives inside the Airdrop Empire mini app.\nOpen it below to claim your bonus 👇"
+  );
+});
+
+// /tasks – missions / offers
+bot.command("tasks", (ctx) => {
+  return sendOpenAppReply(
+    ctx,
+    "📋 All tasks and missions live inside the Airdrop Empire mini app.\nOpen it below to see them 👇"
+  );
+});
+
+// /referral – invite friends
+bot.command("referral", (ctx) => {
+  return sendOpenAppReply(
+    ctx,
+    "👥 Referral rewards are handled inside the Airdrop Empire mini app.\nOpen it below to get your invite link 👇"
+  );
+});
+
+// /withdraw – withdrawals info
+bot.command("withdraw", (ctx) => {
+  return sendOpenAppReply(
+    ctx,
+    "💰 Withdraw requests will be managed inside the Airdrop Empire mini app.\nOpen it below for details 👇"
+  );
+});
+
+// /rank – rank / leaderboard teaser
+bot.command("rank", (ctx) => {
+  return sendOpenAppReply(
+    ctx,
+    "🏆 Ranks & leaderboards will appear inside the Airdrop Empire mini app.\nOpen it below to check your progress 👇"
+  );
+});
+
+// /help – generic help
+bot.command("help", (ctx) => {
+  return sendOpenAppReply(
+    ctx,
+    "ℹ️ All features live inside the Airdrop Empire mini app.\nIf something looks broken, reload the mini app from the blue bar and try again. 👇"
+  );
+});
+
 
 bot.launch();
 console.log("🤖 Telegram bot is running...");
