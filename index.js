@@ -2,7 +2,7 @@
 // Airdrop Empire – Backend Engine (DEV-friendly auth)
 // - Telegram bot (Telegraf)
 // - Express API for mini app
-// - Postgres (Supabase) via pg.Pool
+// - Postgres (Supabase-style) via pg.Pool
 
 // ----------------- Imports & Setup -----------------
 const express = require("express");
@@ -35,20 +35,21 @@ function todayDate() {
   return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
+// Referral reward per new friend (once, when they join)
+const REFERRAL_REWARD = 800;
+
 // ----------------- Telegram initData (DEV MODE, NO HASH CHECK) -----------------
 
 /**
  * Parse Telegram WebApp initData WITHOUT verifying the HMAC hash.
  * This is OK for DEV but later we can re-enable full security.
  *
- * Returns { user, query } on success, or null on failure.
+ * Returns { user, query } on success or null on failure.
  */
 function getTelegramUserFromInitData(initData) {
-  if (!initData || typeof initData !== "string" || initData.trim() === "") {
-    return null;
-  }
-
   try {
+    if (!initData || typeof initData !== "string") return null;
+
     const params = new URLSearchParams(initData);
     const userStr = params.get("user");
     if (!userStr) {
@@ -69,7 +70,7 @@ function getTelegramUserFromInitData(initData) {
 /**
  * DEV version:
  *  1) Tries to parse real Telegram user from initData
- *  2) If it fails, falls back to a hardcoded dev user so Supabase still works
+ *  2) If it fails, falls back to a hardcoded dev user so DB still works
  */
 function telegramAuthMiddleware(req, res, next) {
   const initData = req.body && req.body.initData;
@@ -96,26 +97,26 @@ function telegramAuthMiddleware(req, res, next) {
     }
   }
 
-  // DEV fallback user (use your own Telegram id so it matches Supabase row)
   if (!tgUser) {
+    // Fallback dev user
     tgUser = {
-      id: 7888995060, // your real telegram_id from Supabase
-      is_bot: false,
+      id: 999999999,
+      username: "dev_user",
       first_name: "Dev",
-      username: "devuser",
+      last_name: "User",
       language_code: "en",
     };
   }
 
   req.tgUser = tgUser;
 
-  // Try to extract referral code from start_param if present
+  // Extract referral code from initData (?start=ref_123)
   let refCode = null;
   try {
-    const p = params || (initData ? new URLSearchParams(initData) : null);
-    if (p) {
-      const startParam = p.get("start_param");
-      if (startParam && startParam.trim() !== "") {
+    if (params) {
+      // Sometimes Telegram sends "start" param, sometimes "start_param"
+      const startParam = params.get("start_param") || params.get("start");
+      if (startParam) {
         if (startParam.startsWith("ref_")) {
           refCode = startParam.substring(4);
         } else {
@@ -131,10 +132,10 @@ function telegramAuthMiddleware(req, res, next) {
   next();
 }
 
-// ----------------- DB Helpers -----------------
+// ----------------- DB Init -----------------
 
 async function initDb() {
-  // Users table – matches your existing schema
+  // Main users table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -157,42 +158,17 @@ async function initDb() {
     );
   `);
 
+  // Ensure new columns exist for older deployments
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS tasks (
-      id SERIAL PRIMARY KEY,
-      code TEXT UNIQUE NOT NULL,
-      title TEXT,
-      reward BIGINT DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS referrals_count INT DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS referrals_points BIGINT DEFAULT 0;
   `);
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_tasks (
-      id SERIAL PRIMARY KEY,
-      user_id INT REFERENCES users(id) ON DELETE CASCADE,
-      task_id INT REFERENCES tasks(id) ON DELETE CASCADE,
-      status TEXT DEFAULT 'completed',
-      completed_at TIMESTAMPTZ,
-      UNIQUE(user_id, task_id)
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS withdraw_requests (
-      id SERIAL PRIMARY KEY,
-      user_id INT REFERENCES users(id) ON DELETE CASCADE,
-      amount BIGINT NOT NULL,
-      address TEXT,
-      status TEXT DEFAULT 'pending',
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  console.log("✅ Database initialized");
+  console.log("✅ DB init complete");
 }
+
+// ----------------- Core User Logic -----------------
 
 // Get or create a user record based on Telegram user object
 async function getOrCreateUser(tgUser, refCode = null) {
@@ -213,7 +189,18 @@ async function getOrCreateUser(tgUser, refCode = null) {
 
   const insert = await pool.query(
     `
-      INSERT INTO users (telegram_id, username, first_name, last_name, language_code, balance, energy, today_farmed, last_reset, taps_today)
+      INSERT INTO users (
+        telegram_id,
+        username,
+        first_name,
+        last_name,
+        language_code,
+        balance,
+        energy,
+        today_farmed,
+        last_reset,
+        taps_today
+      )
       VALUES ($1, $2, $3, $4, $5, 0, 50, 0, $6, 0)
       RETURNING *;
     `,
@@ -223,7 +210,53 @@ async function getOrCreateUser(tgUser, refCode = null) {
   const newUser = insert.rows[0];
   console.log("Created new user", telegramId, "with id", newUser.id);
 
-  // TODO: use refCode for referral logic later
+  // Apply referral reward once, when a new user is created with a valid refCode
+  if (refCode) {
+    const refTelegramId = Number(refCode);
+    if (!Number.isNaN(refTelegramId) && refTelegramId !== telegramId) {
+      try {
+        const refUpdate = await pool.query(
+          `
+            UPDATE users
+            SET balance = balance + $1,
+                referrals_count = COALESCE(referrals_count, 0) + 1,
+                referrals_points = COALESCE(referrals_points, 0) + $1,
+                updated_at = NOW()
+            WHERE telegram_id = $2
+            RETURNING id, telegram_id, balance, referrals_count, referrals_points;
+          `,
+          [REFERRAL_REWARD, refTelegramId]
+        );
+
+        if (refUpdate.rows.length > 0) {
+          const r = refUpdate.rows[0];
+          console.log(
+            "Referral reward",
+            REFERRAL_REWARD,
+            "to",
+            r.telegram_id,
+            "new referrals_count=",
+            r.referrals_count,
+            "referrals_points=",
+            r.referrals_points,
+            "from new user",
+            telegramId
+          );
+        } else {
+          console.log(
+            "RefCode provided but no referrer found for telegram_id",
+            refTelegramId
+          );
+        }
+      } catch (err) {
+        console.error(
+          "Error applying referral reward for refCode",
+          refCode,
+          err
+        );
+      }
+    }
+  }
 
   return newUser;
 }
@@ -237,16 +270,14 @@ async function refreshDailyState(user) {
   let tapsToday = user.taps_today;
 
   if (!user.last_reset || user.last_reset.toISOString().slice(0, 10) !== today) {
-    // New day – reset today_farmed, taps_today and energy
+    // New day: reset daily counters and refill energy
     energy = 50;
     todayFarmed = 0;
     tapsToday = 0;
     needsUpdate = true;
   }
 
-  if (!needsUpdate) {
-    return user;
-  }
+  if (!needsUpdate) return user;
 
   const upd = await pool.query(
     `
@@ -260,6 +291,35 @@ async function refreshDailyState(user) {
       RETURNING *;
     `,
     [energy, todayFarmed, tapsToday, today, user.id]
+  );
+
+  return upd.rows[0];
+}
+
+// Apply one tap: decrement energy and add to balance/today
+async function applyTap(user, perTap = 1) {
+  if (user.energy <= 0) {
+    return user;
+  }
+
+  const newEnergy = user.energy - 1;
+  const newBalance = Number(user.balance || 0) + perTap;
+  const newToday = Number(user.today_farmed || 0) + perTap;
+  const newTapsToday = Number(user.taps_today || 0) + 1;
+
+  const upd = await pool.query(
+    `
+      UPDATE users
+      SET balance = $1,
+          energy = $2,
+          today_farmed = $3,
+          taps_today = $4,
+          last_tap_at = NOW(),
+          updated_at = NOW()
+      WHERE id = $5
+      RETURNING *;
+    `,
+    [newBalance, newEnergy, newToday, newTapsToday, user.id]
   );
 
   return upd.rows[0];
@@ -283,13 +343,22 @@ function buildClientState(user) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// /start handler with optional referral code
 bot.start(async (ctx) => {
   const tgUser = ctx.from;
   const payload = (ctx.startPayload || "").trim(); // referral code if any
 
+  // Strip "ref_" prefix if present
+  let refCode = null;
+  if (payload) {
+    if (payload.startsWith("ref_")) {
+      refCode = payload.substring(4);
+    } else {
+      refCode = payload;
+    }
+  }
+
   try {
-    let user = await getOrCreateUser(tgUser, payload || null);
+    let user = await getOrCreateUser(tgUser, refCode || null);
     user = await refreshDailyState(user);
 
     const webAppUrl = "https://resilient-kheer-041b8c.netlify.app";
@@ -315,8 +384,13 @@ bot.start(async (ctx) => {
   }
 });
 
-bot.launch();
-console.log("🤖 Telegram bot is running...");
+// Simple /help
+bot.help((ctx) => ctx.reply("Just hit /start to open the mini app."));
+
+// Launch the bot
+bot.launch().then(() => {
+  console.log("🤖 Telegram bot launched");
+});
 
 // ----------------- Express API for Mini App -----------------
 
@@ -357,42 +431,11 @@ app.post("/api/tap", telegramAuthMiddleware, async (req, res) => {
     if (dbUser.energy <= 0) {
       console.log("/api/tap: no energy for user", dbUser.telegram_id);
       const clientState = buildClientState(dbUser);
-      clientState.error = "NO_ENERGY";
       return res.json(clientState);
     }
 
-    const perTap = 1; // +1 per tap for now
-    const newEnergy = Number(dbUser.energy || 0) - 1;
-    const newBalance = Number(dbUser.balance || 0) + perTap;
-    const newToday = Number(dbUser.today_farmed || 0) + perTap;
-
-    const updateRes = await pool.query(
-      `
-        UPDATE users
-        SET balance = $1,
-            energy = $2,
-            today_farmed = $3,
-            taps_today = taps_today + 1,
-            last_tap_at = NOW(),
-            updated_at = NOW()
-        WHERE id = $4
-        RETURNING *;
-      `,
-      [newBalance, newEnergy, newToday, dbUser.id]
-    );
-
-    const updated = updateRes.rows[0];
-
-    console.log(
-      "/api/tap updated user",
-      updated.telegram_id,
-      "balance",
-      updated.balance,
-      "taps_today",
-      updated.taps_today
-    );
-
-    const clientState = buildClientState(updated);
+    dbUser = await applyTap(dbUser, 1);
+    const clientState = buildClientState(dbUser);
     return res.json(clientState);
   } catch (err) {
     console.error("/api/tap error:", err);
@@ -404,127 +447,50 @@ app.post("/api/tap", telegramAuthMiddleware, async (req, res) => {
 const TASK_REWARDS = {
   daily: 500,
   join_tg: 1000,
-  invite_friend: 1500,
+  invite_friend: 1500, // we now pay referrals via REFERRAL_REWARD when friends join
 };
 
 app.post("/api/task", telegramAuthMiddleware, async (req, res) => {
   try {
     const tgUser = req.tgUser;
     const code = (req.body && req.body.code) || "unknown";
+    const reward = TASK_REWARDS[code] || 0;
 
     let dbUser = await getOrCreateUser(tgUser);
     dbUser = await refreshDailyState(dbUser);
 
-    const reward = TASK_REWARDS[code] || 0;
-    if (!reward) {
+    // Only apply real balance boosts for non-referral tasks
+    if (reward > 0 && code !== "invite_friend") {
+      const newBalance = Number(dbUser.balance || 0) + reward;
+      const newToday = Number(dbUser.today_farmed || 0) + reward;
+
+      const upd = await pool.query(
+        `
+          UPDATE users
+          SET balance = $1,
+              today_farmed = $2,
+              updated_at = NOW()
+          WHERE id = $3
+          RETURNING *;
+        `,
+        [newBalance, newToday, dbUser.id]
+      );
+
+      dbUser = upd.rows[0];
       console.log(
-        "/api/task unknown or zero reward code",
+        "/api/task",
         code,
-        "for user",
+        "reward",
+        reward,
+        "user",
         dbUser.telegram_id
       );
-      const clientState = buildClientState(dbUser);
-      return res.json(clientState);
+    } else if (code === "invite_friend") {
+      // Frontend just opens the Friends sheet; referrals are paid when new users sign up.
+      console.log("/api/task invite_friend hit – no direct reward, handled via referrals");
     }
 
-    let updatedUser = dbUser;
-
-    if (code === "daily") {
-      // Once per calendar day per user
-      const today = todayDate();
-      let lastDailyStr = null;
-
-      if (dbUser.last_daily instanceof Date) {
-        lastDailyStr = dbUser.last_daily.toISOString().slice(0, 10);
-      } else if (typeof dbUser.last_daily === "string") {
-        lastDailyStr = dbUser.last_daily;
-      }
-
-      if (lastDailyStr === today) {
-        console.log(
-          "/api/task daily already claimed for user",
-          dbUser.telegram_id
-        );
-      } else {
-        const upd = await pool.query(
-          `
-            UPDATE users
-            SET balance = balance + $1,
-                today_farmed = today_farmed + $1,
-                last_daily = $2,
-                updated_at = NOW()
-            WHERE id = $3
-            RETURNING *;
-          `,
-          [reward, today, dbUser.id]
-        );
-        updatedUser = upd.rows[0];
-        console.log(
-          "/api/task daily reward",
-          reward,
-          "user",
-          updatedUser.telegram_id
-        );
-      }
-    } else {
-      // One-time tasks (join_tg, invite_friend) using tasks + user_tasks
-      const taskRes = await pool.query(
-        `
-          INSERT INTO tasks (code, title, reward)
-          VALUES ($1, $2, $3)
-          ON CONFLICT (code) DO UPDATE
-          SET reward = EXCLUDED.reward
-          RETURNING id;
-        `,
-        [code, code, reward]
-      );
-      const taskId = taskRes.rows[0].id;
-
-      const existing = await pool.query(
-        `
-          SELECT id FROM user_tasks
-          WHERE user_id = $1 AND task_id = $2;
-        `,
-        [dbUser.id, taskId]
-      );
-
-      if (existing.rows.length > 0) {
-        console.log(
-          "/api/task",
-          code,
-          "already completed for user",
-          dbUser.telegram_id
-        );
-      } else {
-        const upd = await pool.query(
-          `
-            WITH ins AS (
-              INSERT INTO user_tasks (user_id, task_id, status, completed_at)
-              VALUES ($1, $2, 'completed', NOW())
-              RETURNING id
-            )
-            UPDATE users
-            SET balance = balance + $3,
-                today_farmed = today_farmed + $3,
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING *;
-          `,
-          [dbUser.id, taskId, reward]
-        );
-        updatedUser = upd.rows[0];
-        console.log(
-          "/api/task",
-          code,
-          "reward",
-          reward,
-          "user",
-          updatedUser.telegram_id
-        );
-      }
-    }
-
-    const clientState = buildClientState(updatedUser);
+    const clientState = buildClientState(dbUser);
     return res.json(clientState);
   } catch (err) {
     console.error("/api/task error:", err);
@@ -539,8 +505,6 @@ app.post("/api/friends", telegramAuthMiddleware, async (req, res) => {
 
     let dbUser = await getOrCreateUser(tgUser);
     dbUser = await refreshDailyState(dbUser);
-
-    console.log("/api/friends for user", dbUser.telegram_id);
 
     const clientState = buildClientState(dbUser);
     return res.json(clientState);
@@ -558,8 +522,6 @@ app.post("/api/withdraw/info", telegramAuthMiddleware, async (req, res) => {
     let dbUser = await getOrCreateUser(tgUser);
     dbUser = await refreshDailyState(dbUser);
 
-    console.log("/api/withdraw/info for user", dbUser.telegram_id);
-
     const clientState = buildClientState(dbUser);
     return res.json(clientState);
   } catch (err) {
@@ -568,7 +530,7 @@ app.post("/api/withdraw/info", telegramAuthMiddleware, async (req, res) => {
   }
 });
 
-// ----------------- Start Server -----------------
+// ----------------- Server Start -----------------
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
