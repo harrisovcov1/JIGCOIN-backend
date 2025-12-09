@@ -436,6 +436,81 @@ app.post("/api/leaderboard/global", async (req, res) => {
   }
 });
 
+// ------------ NEW: Daily leaderboard (today_farmed) ------------
+app.post("/api/leaderboard/daily", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+
+    const limit = Math.max(
+      1,
+      Math.min(200, Number(req.body.limit || 100))
+    );
+
+    const lbRes = await pool.query(
+      `
+      SELECT
+        telegram_id,
+        username,
+        first_name,
+        last_name,
+        today_farmed,
+        RANK() OVER (ORDER BY today_farmed DESC, telegram_id ASC) AS daily_rank
+      FROM users
+      ORDER BY today_farmed DESC, telegram_id ASC
+      LIMIT $1;
+    `,
+      [limit]
+    );
+
+    const rows = lbRes.rows.map((r) => ({
+      telegram_id: Number(r.telegram_id),
+      username: r.username,
+      first_name: r.first_name,
+      last_name: r.last_name,
+      today_farmed: Number(r.today_farmed || 0),
+      daily_rank: Number(r.daily_rank),
+    }));
+
+    const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
+    const total = Number(totalRes.rows[0].count || 0);
+
+    const myTid = Number(user.telegram_id);
+
+    const myRankRes = await pool.query(
+      `
+      SELECT daily_rank FROM (
+        SELECT
+          telegram_id,
+          RANK() OVER (ORDER BY today_farmed DESC, telegram_id ASC) AS daily_rank
+        FROM users
+      ) ranked
+      WHERE telegram_id = $1
+      LIMIT 1;
+    `,
+      [myTid]
+    );
+
+    let myRank = null;
+    if (myRankRes.rowCount > 0) {
+      myRank = Number(myRankRes.rows[0].daily_rank);
+    }
+
+    res.json({
+      ok: true,
+      me: {
+        telegram_id: myTid,
+        today_farmed: Number(user.today_farmed || 0),
+        daily_rank: myRank,
+        daily_total: total,
+      },
+      daily: rows,
+    });
+  } catch (err) {
+    console.error("Error /api/leaderboard/daily:", err);
+    res.status(500).json({ ok: false, error: "LEADERBOARD_DAILY_ERROR" });
+  }
+});
+
 // ------------ NEW: Friends leaderboard (you + referred friends) ------------
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
