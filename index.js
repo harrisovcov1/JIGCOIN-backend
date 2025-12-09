@@ -387,14 +387,18 @@ app.post("/api/withdraw/info", async (req, res) => {
 
 app.post("/api/leaderboard/global", async (req, res) => {
   try {
-    let user = await getOrCreateUserFromInitData(req);
+    let user = null;
+    try {
+      user = await getOrCreateUserFromInitData(req);
+    } catch (e) {
+      console.error("getOrCreateUserFromInitData failed in GLOBAL leaderboard:", e.message || e);
+    }
 
     const limit = Math.max(
       1,
       Math.min(200, Number(req.body.limit || 100))
     );
 
-    // Top global players by balance
     const lbRes = await pool.query(
       `
       SELECT
@@ -419,16 +423,22 @@ app.post("/api/leaderboard/global", async (req, res) => {
       global_rank: idx + 1,
     }));
 
-    const { rank, total } = await getGlobalRankForUser(user);
+    let me = null;
+    let total = null;
+    if (user && user.telegram_id) {
+      const rankInfo = await getGlobalRankForUser(user);
+      me = {
+        telegram_id: Number(user.telegram_id),
+        balance: Number(user.balance || 0),
+        global_rank: rankInfo.rank,
+        global_total: rankInfo.total,
+      };
+      total = rankInfo.total;
+    }
 
     res.json({
       ok: true,
-      me: {
-        telegram_id: Number(user.telegram_id),
-        balance: Number(user.balance || 0),
-        global_rank: rank,
-        global_total: total,
-      },
+      me,
       global: rows,
     });
   } catch (err) {
@@ -442,7 +452,12 @@ app.post("/api/leaderboard/global", async (req, res) => {
 // ------------ NEW: Daily leaderboard (today_farmed) ------------
 app.post("/api/leaderboard/daily", async (req, res) => {
   try {
-    let user = await getOrCreateUserFromInitData(req);
+    let user = null;
+    try {
+      user = await getOrCreateUserFromInitData(req);
+    } catch (e) {
+      console.error("getOrCreateUserFromInitData failed in DAILY leaderboard:", e.message || e);
+    }
 
     const limit = Math.max(
       1,
@@ -478,11 +493,11 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
     const total = Number(totalRes.rows[0].count || 0);
 
-    const myTid = Number(user.telegram_id);
+    const myTid = user && user.telegram_id ? Number(user.telegram_id) : null;
 
     // Compute my daily rank even if I'm not in the top N
     let myRank = null;
-    if (total > 0) {
+    if (myTid !== null && total > 0) {
       const myRowRes = await pool.query(
         `SELECT today_farmed FROM users WHERE telegram_id = $1 LIMIT 1;`,
         [myTid]
@@ -500,12 +515,14 @@ app.post("/api/leaderboard/daily", async (req, res) => {
 
     res.json({
       ok: true,
-      me: {
-        telegram_id: myTid,
-        today_farmed: Number(user.today_farmed || 0),
-        daily_rank: myRank,
-        daily_total: total,
-      },
+      me: myTid !== null
+        ? {
+            telegram_id: myTid,
+            today_farmed: Number(user.today_farmed || 0),
+            daily_rank: myRank,
+            daily_total: total,
+          }
+        : null,
       daily: rows,
     });
   } catch (err) {
@@ -516,9 +533,26 @@ app.post("/api/leaderboard/daily", async (req, res) => {
 
 
 // ------------ NEW: Friends leaderboard (you + referred friends) ------------
+
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
-    let user = await getOrCreateUserFromInitData(req);
+    let user = null;
+    try {
+      user = await getOrCreateUserFromInitData(req);
+    } catch (e) {
+      console.error("getOrCreateUserFromInitData failed in FRIENDS leaderboard:", e.message || e);
+    }
+
+    if (!user || !user.telegram_id) {
+      // No user context -> return empty friends list but keep request successful
+      return res.json({
+        ok: true,
+        me: null,
+        friends: [],
+        overtake: null,
+      });
+    }
+
     const myTid = Number(user.telegram_id);
 
     const friendsRes = await pool.query(
@@ -566,7 +600,6 @@ app.post("/api/leaderboard/friends", async (req, res) => {
 
     const meEntry = list.find((x) => x.telegram_id === myTid) || null;
 
-    // Small helper for "overtake next friend" prompt
     let overtake = null;
     if (meEntry) {
       const ahead = list.find((x) => x.friend_rank === meEntry.friend_rank - 1);
