@@ -384,6 +384,7 @@ app.post("/api/withdraw/info", async (req, res) => {
 });
 
 // ------------ NEW: Global leaderboard ------------
+
 app.post("/api/leaderboard/global", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
@@ -393,6 +394,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
       Math.min(200, Number(req.body.limit || 100))
     );
 
+    // Top global players by balance
     const lbRes = await pool.query(
       `
       SELECT
@@ -400,8 +402,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
         username,
         first_name,
         last_name,
-        balance,
-        RANK() OVER (ORDER BY balance DESC, telegram_id ASC) AS global_rank
+        balance
       FROM users
       ORDER BY balance DESC, telegram_id ASC
       LIMIT $1;
@@ -409,13 +410,13 @@ app.post("/api/leaderboard/global", async (req, res) => {
       [limit]
     );
 
-    const rows = lbRes.rows.map((r) => ({
+    const rows = lbRes.rows.map((r, idx) => ({
       telegram_id: Number(r.telegram_id),
       username: r.username,
       first_name: r.first_name,
       last_name: r.last_name,
       balance: Number(r.balance || 0),
-      global_rank: Number(r.global_rank),
+      global_rank: idx + 1,
     }));
 
     const { rank, total } = await getGlobalRankForUser(user);
@@ -436,6 +437,8 @@ app.post("/api/leaderboard/global", async (req, res) => {
   }
 });
 
+
+
 // ------------ NEW: Daily leaderboard (today_farmed) ------------
 app.post("/api/leaderboard/daily", async (req, res) => {
   try {
@@ -446,6 +449,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       Math.min(200, Number(req.body.limit || 100))
     );
 
+    // Top daily farmers by today_farmed
     const lbRes = await pool.query(
       `
       SELECT
@@ -453,8 +457,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
         username,
         first_name,
         last_name,
-        today_farmed,
-        RANK() OVER (ORDER BY today_farmed DESC, telegram_id ASC) AS daily_rank
+        today_farmed
       FROM users
       ORDER BY today_farmed DESC, telegram_id ASC
       LIMIT $1;
@@ -462,37 +465,37 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       [limit]
     );
 
-    const rows = lbRes.rows.map((r) => ({
+    const rows = lbRes.rows.map((r, idx) => ({
       telegram_id: Number(r.telegram_id),
       username: r.username,
       first_name: r.first_name,
       last_name: r.last_name,
       today_farmed: Number(r.today_farmed || 0),
-      daily_rank: Number(r.daily_rank),
+      daily_rank: idx + 1,
     }));
 
+    // Total players (for context)
     const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
     const total = Number(totalRes.rows[0].count || 0);
 
     const myTid = Number(user.telegram_id);
 
-    const myRankRes = await pool.query(
-      `
-      SELECT daily_rank FROM (
-        SELECT
-          telegram_id,
-          RANK() OVER (ORDER BY today_farmed DESC, telegram_id ASC) AS daily_rank
-        FROM users
-      ) ranked
-      WHERE telegram_id = $1
-      LIMIT 1;
-    `,
-      [myTid]
-    );
-
+    // Compute my daily rank even if I'm not in the top N
     let myRank = null;
-    if (myRankRes.rowCount > 0) {
-      myRank = Number(myRankRes.rows[0].daily_rank);
+    if (total > 0) {
+      const myRowRes = await pool.query(
+        `SELECT today_farmed FROM users WHERE telegram_id = $1 LIMIT 1;`,
+        [myTid]
+      );
+      if (myRowRes.rowCount > 0) {
+        const myToday = Number(myRowRes.rows[0].today_farmed || 0);
+        const aboveRes = await pool.query(
+          `SELECT COUNT(*) AS count FROM users WHERE today_farmed > $1;`,
+          [myToday]
+        );
+        const countAbove = Number(aboveRes.rows[0].count || 0);
+        myRank = countAbove + 1;
+      }
     }
 
     res.json({
@@ -510,6 +513,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_DAILY_ERROR" });
   }
 });
+
 
 // ------------ NEW: Friends leaderboard (you + referred friends) ------------
 app.post("/api/leaderboard/friends", async (req, res) => {
