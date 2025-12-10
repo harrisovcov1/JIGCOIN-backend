@@ -369,7 +369,8 @@ app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // Refill energy based on time passed
+    // ✅ Refill energy based on time passed
+    user = await applyEnergyRegen(user);   // ← ADD THIS LINE
 
     // Ensure daily counters reset if a new day started
     user = await ensureDailyReset(user);
@@ -381,6 +382,7 @@ app.post("/api/state", async (req, res) => {
     res.status(500).json({ ok: false, error: "STATE_ERROR" });
   }
 });
+
 
 
 
@@ -426,27 +428,65 @@ app.get("/api/state-debug", async (req, res) => {
 
 
 
-// Tap route
+// Tap route – regen + spend 1 energy + add 1 point
 app.post("/api/tap", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // ❌ remove instant regen
-    // user = await applyEnergyRegen(user);
+    // ✅ 1) Refill energy first, based on last_energy_ts
+    user = await applyEnergyRegen(user);
 
-    // Make sure daily limits / counters reset
+    // ✅ 2) New day? reset today_farmed, taps_today, and refill to max
     user = await ensureDailyReset(user);
 
-    // Spend 1 energy + add balance
-    user = await handleTap(user);
+    // ✅ 3) If no energy, don't allow tap
+    const currentEnergy = Number(user.energy || 0);
+    if (currentEnergy <= 0) {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "NO_ENERGY" });
+    }
 
-    const state = await buildClientState(user);
-    res.json(state);
+    // ✅ 4) Daily tap cap
+    const maxTapsPerDay = 5000;
+    const currentTaps = Number(user.taps_today || 0);
+    if (currentTaps >= maxTapsPerDay) {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "MAX_TAPS_REACHED" });
+    }
+
+    // ✅ 5) Spend 1 energy + add 1 point
+    const perTapBase = 1;
+
+    const newBalance = Number(user.balance || 0) + perTapBase;
+    const newEnergy  = currentEnergy - 1;
+    const newToday   = Number(user.today_farmed || 0) + perTapBase;
+    const newTaps    = currentTaps + 1;
+
+    const upd = await pool.query(
+      `
+      UPDATE users
+      SET balance       = $1,
+          energy        = $2,
+          today_farmed  = $3,
+          taps_today    = $4,
+          last_energy_ts = NOW()
+      WHERE id = $5
+      RETURNING *;
+      `,
+      [newBalance, newEnergy, newToday, newTaps, user.id]
+    );
+
+    const updatedUser = upd.rows[0];
+
+    // ✅ 6) Build client state from the *updated* row
+    const state = await buildClientState(updatedUser);
+    return res.json({ ...state, ok: true });
   } catch (err) {
     console.error("Error /api/tap:", err);
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
+
 
 
 // Daily task route (simple daily + backend sync)
