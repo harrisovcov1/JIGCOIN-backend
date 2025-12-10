@@ -383,6 +383,37 @@ app.post("/api/state", async (req, res) => {
   }
 });
 
+
+// DEBUG: GET state for a given telegram_id (for testing in browser)
+app.get("/api/state-debug", async (req, res) => {
+  try {
+    // Use dev fallback: allow telegram_id in query (?telegram_id=123)
+    if (!req.query.telegram_id) {
+      return res.status(400).json({ ok: false, error: "MISSING_TELEGRAM_ID" });
+    }
+
+    // Fake initData user from telegram_id so getOrCreateUserFromInitData works
+    req.body = req.body || {};
+    req.body.telegram_id = Number(req.query.telegram_id);
+
+    let user = await getOrCreateUserFromInitData(req);
+
+    // Refill energy based on time passed
+    user = await applyEnergyRegen(user);
+
+    // Ensure daily counters reset if a new day started
+    user = await ensureDailyReset(user);
+
+    const state = await buildClientState(user);
+    res.json(state);
+  } catch (err) {
+    console.error("Error /api/state-debug:", err);
+    res.status(500).json({ ok: false, error: "STATE_DEBUG_ERROR" });
+  }
+});
+
+
+
 // Tap route
 app.post("/api/tap", async (req, res) => {
   try {
