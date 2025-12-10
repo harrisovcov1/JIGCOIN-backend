@@ -252,37 +252,50 @@ async function applyEnergyRegen(user) {
 async function ensureDailyReset(user) {
   const today = todayDate();
 
-  // Normalise last_reset into a "YYYY-MM-DD" string
   let lastResetStr = null;
-  if (user.last_reset) {
-    if (typeof user.last_reset === "string") {
-      // Postgres often returns DATE as 'YYYY-MM-DD'
-      lastResetStr = user.last_reset.slice(0, 10);
-    } else {
-      // If it comes back as a Date object / timestamp
-      lastResetStr = new Date(user.last_reset).toISOString().slice(0, 10);
+
+  try {
+    if (user.last_reset) {
+      if (typeof user.last_reset === "string") {
+        // e.g. '2025-12-10' or '2025-12-10T00:00:00.000Z'
+        lastResetStr = user.last_reset.slice(0, 10);
+      } else if (user.last_reset instanceof Date && !isNaN(user.last_reset)) {
+        lastResetStr = user.last_reset.toISOString().slice(0, 10);
+      } else {
+        const tmp = new Date(user.last_reset);
+        if (!isNaN(tmp)) {
+          lastResetStr = tmp.toISOString().slice(0, 10);
+        }
+      }
     }
+  } catch (e) {
+    console.error("ensureDailyReset: bad last_reset value:", user.last_reset, e);
+    // Force a safe reset below
+    lastResetStr = null;
   }
 
-  // Only reset if it's actually a different day
-  if (lastResetStr !== today) {
-    const res = await pool.query(
-      `
+  // If same calendar day, nothing to do
+  if (lastResetStr === today) {
+    return user;
+  }
+
+  // Different (or unknown) day → reset daily counters + refill energy
+  const res = await pool.query(
+    `
       UPDATE users
       SET today_farmed = 0,
           taps_today   = 0,
-          energy       = max_energy,   -- full refill ONCE per new day
+          energy       = max_energy,
           last_reset   = $1
       WHERE id = $2
       RETURNING *;
     `,
-      [today, user.id]
-    );
-    return res.rows[0];
-  }
+    [today, user.id]
+  );
 
-  return user;
+  return res.rows[0];
 }
+
 
 
 
