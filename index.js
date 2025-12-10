@@ -432,8 +432,8 @@ app.post("/api/tap", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // First refill based on time
-    user = await applyEnergyRegen(user);
+    // ❌ remove instant regen
+    // user = await applyEnergyRegen(user);
 
     // Make sure daily limits / counters reset
     user = await ensureDailyReset(user);
