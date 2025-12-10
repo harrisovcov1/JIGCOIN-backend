@@ -260,6 +260,7 @@ async function ensureDailyReset(user) {
       UPDATE users
       SET today_farmed = 0,
           taps_today = 0,
+          energy = max_energy,   -- full refill each new day
           last_reset = $1
       WHERE id = $2
       RETURNING *;
@@ -270,6 +271,7 @@ async function ensureDailyReset(user) {
   }
   return user;
 }
+
 
 
 // ------------ Tap logic ------------
