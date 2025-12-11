@@ -39,6 +39,9 @@ const REFERRAL_REWARD = 800;
 // Cost (in points) for paid energy refill boost
 const ENERGY_REFILL_COST = 500;
 
+// Cost (in points) for paid double-points boost (10 mins)
+const DOUBLE_BOOST_COST = 1000;
+
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
@@ -113,19 +116,18 @@ async function getOrCreateUserFromInitData(req) {
         last_reset DATE,
         last_energy_ts TIMESTAMPTZ,
         taps_today INT DEFAULT 0,
-        referrals_count INT DEFAULT 0,
-        referrals_points BIGINT DEFAULT 0
+        referrals_count BIGINT DEFAULT 0,
+        referrals_points BIGINT DEFAULT 0,
+        double_boost_until TIMESTAMPTZ
       );
     `);
-
 
     await client.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
-      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
     `);
-
-
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS referrals (
@@ -175,9 +177,10 @@ async function getOrCreateUserFromInitData(req) {
           last_reset,
           taps_today,
           referrals_count,
-          referrals_points
+          referrals_points,
+          double_boost_until
         )
-        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0)
+        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0, NULL)
         RETURNING *;
       `,
         [telegramUserId, username, firstName, lastName, languageCode]
@@ -199,9 +202,7 @@ async function applyEnergyRegen(user) {
   const now = new Date();
 
   // If never had regen timestamp, pretend they've been away for a while
-  // so we can safely top them up.
   if (!user.last_energy_ts) {
-    // Treat as if last update was 1 hour ago
     user.last_energy_ts = new Date(now.getTime() - 60 * 60 * 1000);
   }
 
@@ -214,7 +215,7 @@ async function applyEnergyRegen(user) {
   while (diffSeconds > 0 && energy < maxEnergy) {
     let step;
 
-    // Option C Hybrid formula
+    // Hybrid formula
     if (energy < 10) {
       step = 1;   // 1 energy per second
     } else if (energy < 30) {
@@ -249,8 +250,6 @@ async function applyEnergyRegen(user) {
   return user;
 }
 
-
-
 // ------------ Daily reset ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
@@ -260,7 +259,6 @@ async function ensureDailyReset(user) {
   try {
     if (user.last_reset) {
       if (typeof user.last_reset === "string") {
-        // e.g. '2025-12-10' or '2025-12-10T00:00:00.000Z'
         lastResetStr = user.last_reset.slice(0, 10);
       } else if (user.last_reset instanceof Date && !isNaN(user.last_reset)) {
         lastResetStr = user.last_reset.toISOString().slice(0, 10);
@@ -273,16 +271,13 @@ async function ensureDailyReset(user) {
     }
   } catch (e) {
     console.error("ensureDailyReset: bad last_reset value:", user.last_reset, e);
-    // Force a safe reset below
     lastResetStr = null;
   }
 
-  // If same calendar day, nothing to do
   if (lastResetStr === today) {
     return user;
   }
 
-  // Different (or unknown) day → reset daily counters + refill energy
   const res = await pool.query(
     `
       UPDATE users
@@ -299,11 +294,7 @@ async function ensureDailyReset(user) {
   return res.rows[0];
 }
 
-
-
-
-
-// ------------ Tap logic ------------
+// (legacy helper – not used by routes but kept updated)
 async function handleTap(user) {
   const maxEnergy = 50;
   const perTapBase = 1;
@@ -323,9 +314,16 @@ async function handleTap(user) {
     return user;
   }
 
-  const newBalance = Number(user.balance || 0) + perTapBase;
+  // Double-boost awareness
+  const now = new Date();
+  let perTap = perTapBase;
+  if (user.double_boost_until && new Date(user.double_boost_until) > now) {
+    perTap = perTapBase * 2;
+  }
+
+  const newBalance = Number(user.balance || 0) + perTap;
   const newEnergy = Number(user.energy || 0) - 1;
-  const newToday = Number(user.today_farmed || 0) + perTapBase;
+  const newToday = Number(user.today_farmed || 0) + perTap;
   const newTapsToday = Number(user.taps_today || 0) + 1;
 
   const upd = await pool.query(
@@ -343,7 +341,6 @@ async function handleTap(user) {
 
   return upd.rows[0];
 }
-
 // ------------ Global rank helper ------------
 async function getGlobalRankForUser(user) {
   const balance = Number(user.balance || 0);
@@ -376,6 +373,17 @@ async function buildClientState(user) {
 
   const { rank, total } = await getGlobalRankForUser(user);
 
+  // Double boost status
+  let doubleBoostActive = false;
+  let doubleBoostUntil = null;
+  if (user.double_boost_until) {
+    const untilDate = new Date(user.double_boost_until);
+    if (!isNaN(untilDate)) {
+      doubleBoostUntil = untilDate.toISOString();
+      doubleBoostActive = untilDate > new Date();
+    }
+  }
+
   return {
     ok: true,
     balance: Number(user.balance || 0),
@@ -386,6 +394,8 @@ async function buildClientState(user) {
     referrals_points: Number(user.referrals_points || 0),
     global_rank: rank,
     global_total: total,
+    double_boost_active: doubleBoostActive,
+    double_boost_until: doubleBoostUntil,
   };
 }
 
@@ -401,8 +411,8 @@ app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // ✅ Refill energy based on time passed
-    user = await applyEnergyRegen(user);   // ← ADD THIS LINE
+    // Refill energy based on time passed
+    user = await applyEnergyRegen(user);
 
     // Ensure daily counters reset if a new day started
     user = await ensureDailyReset(user);
@@ -415,13 +425,9 @@ app.post("/api/state", async (req, res) => {
   }
 });
 
-
-
-
 // DEBUG: GET state for a given telegram_id (for testing in browser)
 app.get("/api/state-debug", async (req, res) => {
   try {
-    // Always respond as plain text so it's easy to see in Safari
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
 
     res.write("STATE-DEBUG ROUTE REACHED\n");
@@ -432,7 +438,6 @@ app.get("/api/state-debug", async (req, res) => {
       return res.end();
     }
 
-    // Use dev fallback: pass telegram_id into our existing helper
     req.body = req.body || {};
     req.body.telegram_id = Number(req.query.telegram_id);
 
@@ -458,27 +463,25 @@ app.get("/api/state-debug", async (req, res) => {
   }
 });
 
-
-
-// Tap route – regen + spend 1 energy + add 1 point
+// Tap route – regen + spend 1 energy + add points (x2 if boost)
 app.post("/api/tap", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // ✅ 1) Refill energy first, based on last_energy_ts
+    // 1) Refill energy first, based on last_energy_ts
     user = await applyEnergyRegen(user);
 
-    // ✅ 2) New day? reset today_farmed, taps_today, and refill to max
+    // 2) New day? reset today_farmed, taps_today, and refill to max
     user = await ensureDailyReset(user);
 
-    // ✅ 3) If no energy, don't allow tap
+    // 3) If no energy, don't allow tap
     const currentEnergy = Number(user.energy || 0);
     if (currentEnergy <= 0) {
       const state = await buildClientState(user);
       return res.json({ ...state, ok: false, reason: "NO_ENERGY" });
     }
 
-    // ✅ 4) Daily tap cap
+    // 4) Daily tap cap
     const maxTapsPerDay = 5000;
     const currentTaps = Number(user.taps_today || 0);
     if (currentTaps >= maxTapsPerDay) {
@@ -486,21 +489,30 @@ app.post("/api/tap", async (req, res) => {
       return res.json({ ...state, ok: false, reason: "MAX_TAPS_REACHED" });
     }
 
-    // ✅ 5) Spend 1 energy + add 1 point
-    const perTapBase = 1;
+    // 5) Spend 1 energy + add points (double if boost still active)
+    const basePerTap = 1;
+    const now = new Date();
+    let perTap = basePerTap;
 
-    const newBalance = Number(user.balance || 0) + perTapBase;
-    const newEnergy  = currentEnergy - 1;
-    const newToday   = Number(user.today_farmed || 0) + perTapBase;
-    const newTaps    = currentTaps + 1;
+    if (user.double_boost_until) {
+      const until = new Date(user.double_boost_until);
+      if (!isNaN(until) && until > now) {
+        perTap = basePerTap * 2;
+      }
+    }
+
+    const newBalance = Number(user.balance || 0) + perTap;
+    const newEnergy = currentEnergy - 1;
+    const newToday = Number(user.today_farmed || 0) + perTap;
+    const newTaps = currentTaps + 1;
 
     const upd = await pool.query(
       `
       UPDATE users
-      SET balance       = $1,
-          energy        = $2,
-          today_farmed  = $3,
-          taps_today    = $4,
+      SET balance        = $1,
+          energy         = $2,
+          today_farmed   = $3,
+          taps_today     = $4,
           last_energy_ts = NOW()
       WHERE id = $5
       RETURNING *;
@@ -510,7 +522,6 @@ app.post("/api/tap", async (req, res) => {
 
     const updatedUser = upd.rows[0];
 
-    // ✅ 6) Build client state from the *updated* row
     const state = await buildClientState(updatedUser);
     return res.json({ ...state, ok: true });
   } catch (err) {
@@ -533,7 +544,6 @@ app.post("/api/boost/energy", async (req, res) => {
     const maxEnergy = Number(user.max_energy || 50);
     const currentEnergy = Number(user.energy || 0);
 
-    // Already full – nothing to do
     if (currentEnergy >= maxEnergy) {
       const state = await buildClientState(user);
       return res.json({ ...state, ok: false, reason: "ENERGY_FULL" });
@@ -562,7 +572,6 @@ app.post("/api/boost/energy", async (req, res) => {
       );
       updatedUser = upd.rows[0];
     } else {
-      // "action" path – free refill (later we plug real paid offers into this)
       const upd = await pool.query(
         `
         UPDATE users
@@ -580,11 +589,12 @@ app.post("/api/boost/energy", async (req, res) => {
     return res.json({
       ...state,
       ok: true,
-message:
-  method === "points"
-    ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString("en-GB")} pts spent.`
-    : "⚡ Free energy boost activated.",
-
+      message:
+        method === "points"
+          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
+          : "⚡ Free energy boost activated.",
     });
   } catch (err) {
     console.error("Error /api/boost/energy:", err);
@@ -592,7 +602,70 @@ message:
   }
 });
 
+// Double points boost – 10 minutes of x2 taps
+app.post("/api/boost/double", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
 
+    // Keep regen + daily stats consistent
+    user = await applyEnergyRegen(user);
+    user = await ensureDailyReset(user);
+
+    const method = req.body.method === "points" ? "points" : "action";
+
+    let updatedUser;
+
+    if (method === "points") {
+      const currentBalance = Number(user.balance || 0);
+      if (currentBalance < DOUBLE_BOOST_COST) {
+        const state = await buildClientState(user);
+        return res.json({ ...state, ok: false, reason: "NOT_ENOUGH_POINTS" });
+      }
+
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET balance = balance - $1,
+            double_boost_until =
+              GREATEST(COALESCE(double_boost_until, NOW()), NOW()) + INTERVAL '10 minutes'
+        WHERE id = $2
+        RETURNING *;
+        `,
+        [DOUBLE_BOOST_COST, user.id]
+      );
+      updatedUser = upd.rows[0];
+    } else {
+      // "action" path – free sponsor-based boost
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET double_boost_until =
+              GREATEST(COALESCE(double_boost_until, NOW()), NOW()) + INTERVAL '10 minutes'
+        WHERE id = $1
+        RETURNING *;
+        `,
+        [user.id]
+      );
+      updatedUser = upd.rows[0];
+    }
+
+    const state = await buildClientState(updatedUser);
+
+    return res.json({
+      ...state,
+      ok: true,
+      message:
+        method === "points"
+          ? `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
+          : "✨ Free double points boost activated!",
+    });
+  } catch (err) {
+    console.error("Error /api/boost/double:", err);
+    res.status(500).json({ ok: false, error: "BOOST_DOUBLE_ERROR" });
+  }
+});
 
 // Daily task route (simple daily + backend sync)
 app.post("/api/task", async (req, res) => {
@@ -659,7 +732,6 @@ app.post("/api/withdraw/info", async (req, res) => {
 });
 
 // ------------ NEW: Global leaderboard ------------
-
 app.post("/api/leaderboard/global", async (req, res) => {
   try {
     let user = null;
@@ -669,10 +741,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
       console.error("getOrCreateUserFromInitData failed in GLOBAL leaderboard:", e.message || e);
     }
 
-    const limit = Math.max(
-      1,
-      Math.min(200, Number(req.body.limit || 100))
-    );
+    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
 
     const lbRes = await pool.query(
       `
@@ -699,7 +768,6 @@ app.post("/api/leaderboard/global", async (req, res) => {
     }));
 
     let me = null;
-    let total = null;
     if (user && user.telegram_id) {
       const rankInfo = await getGlobalRankForUser(user);
       me = {
@@ -708,7 +776,6 @@ app.post("/api/leaderboard/global", async (req, res) => {
         global_rank: rankInfo.rank,
         global_total: rankInfo.total,
       };
-      total = rankInfo.total;
     }
 
     res.json({
@@ -722,8 +789,6 @@ app.post("/api/leaderboard/global", async (req, res) => {
   }
 });
 
-
-
 // ------------ NEW: Daily leaderboard (today_farmed) ------------
 app.post("/api/leaderboard/daily", async (req, res) => {
   try {
@@ -734,12 +799,8 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       console.error("getOrCreateUserFromInitData failed in DAILY leaderboard:", e.message || e);
     }
 
-    const limit = Math.max(
-      1,
-      Math.min(200, Number(req.body.limit || 100))
-    );
+    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
 
-    // Top daily farmers by today_farmed
     const lbRes = await pool.query(
       `
       SELECT
@@ -764,13 +825,11 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       daily_rank: idx + 1,
     }));
 
-    // Total players (for context)
     const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
     const total = Number(totalRes.rows[0].count || 0);
 
     const myTid = user && user.telegram_id ? Number(user.telegram_id) : null;
 
-    // Compute my daily rank even if I'm not in the top N
     let myRank = null;
     if (myTid !== null && total > 0) {
       const myRowRes = await pool.query(
@@ -790,14 +849,15 @@ app.post("/api/leaderboard/daily", async (req, res) => {
 
     res.json({
       ok: true,
-      me: myTid !== null
-        ? {
-            telegram_id: myTid,
-            today_farmed: Number(user.today_farmed || 0),
-            daily_rank: myRank,
-            daily_total: total,
-          }
-        : null,
+      me:
+        myTid !== null
+          ? {
+              telegram_id: myTid,
+              today_farmed: Number(user.today_farmed || 0),
+              daily_rank: myRank,
+              daily_total: total,
+            }
+          : null,
       daily: rows,
     });
   } catch (err) {
@@ -806,9 +866,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
   }
 });
 
-
-// ------------ NEW: Friends leaderboard (you + referred friends) ------------
-
+// ------------ NEW: Friends leaderboard ------------
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
     let user = null;
@@ -819,7 +877,6 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     }
 
     if (!user || !user.telegram_id) {
-      // No user context -> return empty friends list but keep request successful
       return res.json({
         ok: true,
         me: null,
@@ -847,8 +904,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
       .map((r) => Number(r.friend_id))
       .filter((v) => !!v && v !== myTid);
 
-    const idsForQuery =
-      friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
+    const idsForQuery = friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
 
     const usersRes = await pool.query(
       `
@@ -898,7 +954,6 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
-
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
