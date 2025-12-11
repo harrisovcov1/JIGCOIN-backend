@@ -1045,7 +1045,7 @@ app.post("/api/boost/completeAd", async (req, res) => {
   }
 });
 
-// Daily task route (simple daily + backend sync)
+// Daily task route (simple daily + backend sync, FIXED one-claim-per-day)
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
@@ -1055,9 +1055,26 @@ app.post("/api/task", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
     }
 
-    const today = todayDate();
+    const today = todayDate(); // "YYYY-MM-DD"
 
-    if (user.last_daily !== today) {
+    // Normalise last_daily (can be Date or null)
+    let lastDailyStr = null;
+    try {
+      if (user.last_daily) {
+        if (typeof user.last_daily === "string") {
+          lastDailyStr = user.last_daily.slice(0, 10);
+        } else {
+          const d = new Date(user.last_daily);
+          if (!isNaN(d)) lastDailyStr = d.toISOString().slice(0, 10);
+        }
+      }
+    } catch (e) {
+      console.error("Bad last_daily:", user.last_daily, e);
+      lastDailyStr = null;
+    }
+
+    // Only reward if today is different from last_daily
+    if (lastDailyStr !== today) {
       const reward = Number(req.body.reward || 1000);
       const newBalance = Number(user.balance || 0) + reward;
 
@@ -1068,7 +1085,7 @@ app.post("/api/task", async (req, res) => {
             last_daily = $2
         WHERE id = $3
         RETURNING *;
-      `,
+        `,
         [newBalance, today, user.id]
       );
       user = upd.rows[0];
@@ -1081,6 +1098,7 @@ app.post("/api/task", async (req, res) => {
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
 });
+
 
 // Friends summary (kept for existing front-end)
 app.post("/api/friends", async (req, res) => {
