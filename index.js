@@ -391,7 +391,7 @@ async function getGlobalRankForUser(user) {
 }
 
 // ------------ Build state for frontend ------------
-async function buildClientState(user) {
+  async function buildClientState(user) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?start=ref_${user.telegram_id}`;
 
   const { rank, total } = await getGlobalRankForUser(user);
@@ -421,6 +421,7 @@ async function buildClientState(user) {
     double_boost_until: doubleBoostUntil,
   };
 }
+
 
 // ------------ NEW: generic reward helpers ------------
 async function applyGenericReward(user, rewardType, rewardAmount) {
