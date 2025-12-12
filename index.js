@@ -56,6 +56,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ------------ Auth / Errors ------------
+function makeAuthError(code, message) {
+  const e = new Error(message || code);
+  e.code = code;
+  return e;
+}
+
+function sendAuthError(res, err) {
+  // For missing Telegram identity, always return 401 so frontend can handle it cleanly.
+  if (err && err.code === "MISSING_TELEGRAM_ID") {
+    return res.status(401).json({ ok: false, error: "MISSING_TELEGRAM_ID" });
+  }
+  return null;
+}
+
 // ------------ Mini-app auth helper ------------
 function parseInitData(initDataRaw) {
   if (!initDataRaw) return {};
@@ -67,9 +82,23 @@ function parseInitData(initDataRaw) {
   return data;
 }
 
-// Get or create a user from Telegram initData / dev fallback
+function coerceTelegramId(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  if (Number.isNaN(n) || !Number.isFinite(n)) return null;
+  if (n <= 0) return null;
+  // Telegram user IDs can exceed 32-bit; we keep as Number in JS but store BIGINT in DB.
+  return n;
+}
+
+// Get or create a user from Telegram initData / dev fallback (NOW MUCH MORE ROBUST)
 async function getOrCreateUserFromInitData(req) {
-  const initDataRaw = req.body.initData || req.query.initData || "";
+  const initDataRaw =
+    (req.body && req.body.initData) ||
+    (req.query && req.query.initData) ||
+    (req.headers && req.headers["x-telegram-initdata"]) ||
+    "";
+
   const data = parseInitData(initDataRaw);
 
   let telegramUserId = null;
@@ -78,10 +107,11 @@ async function getOrCreateUserFromInitData(req) {
   let lastName = null;
   let languageCode = null;
 
+  // 1) Preferred: Telegram initData user payload
   if (data.user) {
     try {
       const u = JSON.parse(data.user);
-      telegramUserId = u.id;
+      telegramUserId = coerceTelegramId(u.id);
       username = u.username || null;
       firstName = u.first_name || null;
       lastName = u.last_name || null;
@@ -91,17 +121,28 @@ async function getOrCreateUserFromInitData(req) {
     }
   }
 
-  // DEV fallback: allow telegram_id in body or query
+  // 2) Fallbacks: accept telegram_id from body/query/header (covers your current broken clients)
   if (!telegramUserId) {
-    if (req.body.telegram_id) {
-      telegramUserId = Number(req.body.telegram_id);
-    } else if (req.query.telegram_id) {
-      telegramUserId = Number(req.query.telegram_id);
+    const candidates = [
+      req.body && req.body.telegram_id,
+      req.body && req.body.telegramId,
+      req.query && req.query.telegram_id,
+      req.query && req.query.telegramId,
+      req.headers && req.headers["x-telegram-id"],
+      req.headers && req.headers["x-telegramid"],
+    ];
+
+    for (const c of candidates) {
+      const tid = coerceTelegramId(c);
+      if (tid) {
+        telegramUserId = tid;
+        break;
+      }
     }
   }
 
   if (!telegramUserId) {
-    throw new Error("Missing Telegram user ID");
+    throw makeAuthError("MISSING_TELEGRAM_ID", "Missing Telegram user ID");
   }
 
   const client = await pool.connect();
@@ -288,9 +329,9 @@ async function applyEnergyRegen(user) {
   while (diffSeconds > 0 && energy < maxEnergy) {
     let step;
 
-    if (energy < 10) step = 1;      // fast regen
+    if (energy < 10) step = 1; // fast regen
     else if (energy < 30) step = 3; // medium regen
-    else step = 6;                  // slow regen
+    else step = 6; // slow regen
 
     if (diffSeconds >= step) {
       energy += 1;
@@ -365,10 +406,7 @@ async function handleTap(user) {
 
   let perTap = 1;
 
-  if (
-    user.double_boost_until &&
-    new Date(user.double_boost_until) > new Date()
-  ) {
+  if (user.double_boost_until && new Date(user.double_boost_until) > new Date()) {
     perTap = 2;
   }
 
@@ -511,8 +549,8 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
 async function applyMissionReward(user, mission) {
   return applyGenericReward(user, mission.payout_type, mission.payout_amount);
 }
-// ------------ Express Routes ------------
 
+// ------------ Express Routes ------------
 // Health check
 app.get("/", (req, res) => {
   res.send("Airdrop Empire backend is running.");
@@ -533,6 +571,11 @@ app.post("/api/state", async (req, res) => {
     res.json(state);
   } catch (err) {
     console.error("Error /api/state:", err);
+
+    // ✅ IMPORTANT: do NOT 500 on missing Telegram ID (this was breaking everything)
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "STATE_ERROR" });
   }
 });
@@ -543,9 +586,7 @@ app.get("/api/state-debug", async (req, res) => {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
 
     res.write("STATE-DEBUG ROUTE REACHED\n");
-    res.write(
-      "query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n"
-    );
+    res.write("query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n");
 
     if (!req.query.telegram_id) {
       res.write("ERROR: MISSING_TELEGRAM_ID\n");
@@ -639,6 +680,11 @@ app.post("/api/tap", async (req, res) => {
     return res.json({ ...state, ok: true });
   } catch (err) {
     console.error("Error /api/tap:", err);
+
+    // ✅ IMPORTANT: do NOT 500 on missing Telegram ID
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
@@ -652,7 +698,7 @@ app.post("/api/boost/energy", async (req, res) => {
     user = await applyEnergyRegen(user);
     user = await ensureDailyReset(user);
 
-    const method = req.body.method === "points" ? "points" : "action";
+    const method = req.body && req.body.method === "points" ? "points" : "action";
 
     const maxEnergy = Number(user.max_energy || 50);
     const currentEnergy = Number(user.energy || 0);
@@ -669,11 +715,7 @@ app.post("/api/boost/energy", async (req, res) => {
 
       if (currentBalance < ENERGY_REFILL_COST) {
         const state = await buildClientState(user);
-        return res.json({
-          ...state,
-          ok: false,
-          reason: "NOT_ENOUGH_POINTS",
-        });
+        return res.json({ ...state, ok: false, reason: "NOT_ENOUGH_POINTS" });
       }
 
       const upd = await pool.query(
@@ -708,13 +750,15 @@ app.post("/api/boost/energy", async (req, res) => {
       ok: true,
       message:
         method === "points"
-          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString(
-              "en-GB"
-            )} pts spent.`
+          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString("en-GB")} pts spent.`
           : "⚡ Free energy boost activated.",
     });
   } catch (err) {
     console.error("Error /api/boost/energy:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "BOOST_ENERGY_ERROR" });
   }
 });
@@ -728,7 +772,7 @@ app.post("/api/boost/double", async (req, res) => {
     user = await applyEnergyRegen(user);
     user = await ensureDailyReset(user);
 
-    const method = req.body.method === "points" ? "points" : "action";
+    const method = req.body && req.body.method === "points" ? "points" : "action";
 
     let updatedUser;
 
@@ -773,13 +817,15 @@ app.post("/api/boost/double", async (req, res) => {
       ok: true,
       message:
         method === "points"
-          ? `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString(
-              "en-GB"
-            )} pts spent.`
+          ? `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString("en-GB")} pts spent.`
           : "✨ Free double points boost activated!",
     });
   } catch (err) {
     console.error("Error /api/boost/double:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "BOOST_DOUBLE_ERROR" });
   }
 });
@@ -790,7 +836,7 @@ app.post("/api/boost/double", async (req, res) => {
 app.post("/api/mission/list", async (req, res) => {
   try {
     const user = await getOrCreateUserFromInitData(req);
-    const kind = req.body.kind || null;
+    const kind = (req.body && req.body.kind) || null;
 
     const params = [];
     let where = "WHERE is_active = TRUE";
@@ -850,6 +896,10 @@ app.post("/api/mission/list", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/mission/list:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "MISSION_LIST_ERROR" });
   }
 });
@@ -858,12 +908,10 @@ app.post("/api/mission/list", async (req, res) => {
 app.post("/api/mission/start", async (req, res) => {
   try {
     const user = await getOrCreateUserFromInitData(req);
-    const code = (req.body.code || "").trim();
+    const code = ((req.body && req.body.code) || "").trim();
 
     if (!code) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "MISSING_MISSION_CODE" });
+      return res.status(400).json({ ok: false, error: "MISSING_MISSION_CODE" });
     }
 
     const missionRes = await pool.query(
@@ -877,9 +925,7 @@ app.post("/api/mission/start", async (req, res) => {
     );
 
     if (missionRes.rowCount === 0) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "MISSION_NOT_FOUND_OR_INACTIVE" });
+      return res.status(404).json({ ok: false, error: "MISSION_NOT_FOUND_OR_INACTIVE" });
     }
 
     const mission = missionRes.rows[0];
@@ -903,6 +949,10 @@ app.post("/api/mission/start", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/mission/start:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "MISSION_START_ERROR" });
   }
 });
@@ -911,12 +961,10 @@ app.post("/api/mission/start", async (req, res) => {
 app.post("/api/mission/complete", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    const code = (req.body.code || "").trim();
+    const code = ((req.body && req.body.code) || "").trim();
 
     if (!code) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "MISSING_MISSION_CODE" });
+      return res.status(400).json({ ok: false, error: "MISSING_MISSION_CODE" });
     }
 
     const missionRes = await pool.query(
@@ -976,10 +1024,15 @@ app.post("/api/mission/complete", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/mission/complete:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "MISSION_COMPLETE_ERROR" });
   }
 });
 
+// ------------ Rewarded Ad helper endpoints ------------
 // ------------ Rewarded Ad helper endpoints ------------
 
 // Create an ad session (front-end calls before showing video/ad)
@@ -987,9 +1040,9 @@ app.post("/api/boost/requestAd", async (req, res) => {
   try {
     const user = await getOrCreateUserFromInitData(req);
 
-    const rewardType = req.body.reward_type || "energy_refill"; // 'points', 'energy_refill', 'double_10m'
-    const rewardAmount = Number(req.body.reward_amount || 0);
-    const network = req.body.network || null;
+    const rewardType = (req.body && req.body.reward_type) || "energy_refill"; // 'points', 'energy_refill', 'double_10m'
+    const rewardAmount = Number((req.body && req.body.reward_amount) || 0);
+    const network = (req.body && req.body.network) || null;
 
     const validTypes = ["points", "energy_refill", "double_10m"];
     if (!validTypes.includes(rewardType)) {
@@ -1015,6 +1068,10 @@ app.post("/api/boost/requestAd", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/boost/requestAd:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "REQUEST_AD_ERROR" });
   }
 });
@@ -1023,7 +1080,7 @@ app.post("/api/boost/requestAd", async (req, res) => {
 app.post("/api/boost/completeAd", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    const sessionId = Number(req.body.ad_session_id || 0);
+    const sessionId = Number((req.body && req.body.ad_session_id) || 0);
 
     if (!sessionId) {
       return res.status(400).json({ ok: false, error: "MISSING_SESSION_ID" });
@@ -1069,6 +1126,10 @@ app.post("/api/boost/completeAd", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/boost/completeAd:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "COMPLETE_AD_ERROR" });
   }
 });
@@ -1077,13 +1138,13 @@ app.post("/api/boost/completeAd", async (req, res) => {
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    const taskName = (req.body.taskName || "").trim();
+    const taskName = ((req.body && req.body.taskName) || "").trim();
 
     if (!taskName) {
       return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
     }
 
-    const reward = Number(req.body.reward || 1000);
+    const reward = Number((req.body && req.body.reward) || 1000);
     const today = todayDate();
 
     if (taskName === "daily") {
@@ -1161,7 +1222,6 @@ app.post("/api/task", async (req, res) => {
         );
 
         if (ins.rowCount === 0) {
-          // Already completed before
           await client.query("COMMIT");
           const state = await buildClientState(user);
           return res.json({
@@ -1199,6 +1259,10 @@ app.post("/api/task", async (req, res) => {
     }
   } catch (err) {
     console.error("Error /api/task:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
 });
@@ -1211,6 +1275,10 @@ app.post("/api/friends", async (req, res) => {
     res.json(state);
   } catch (err) {
     console.error("Error /api/friends:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "FRIENDS_ERROR" });
   }
 });
@@ -1226,6 +1294,10 @@ app.post("/api/withdraw/info", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/withdraw/info:", err);
+
+    const handled = sendAuthError(res, err);
+    if (handled) return;
+
     res.status(500).json({ ok: false, error: "WITHDRAW_INFO_ERROR" });
   }
 });
@@ -1237,13 +1309,11 @@ app.post("/api/leaderboard/global", async (req, res) => {
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error(
-        "getOrCreateUserFromInitData failed in GLOBAL leaderboard:",
-        e.message || e
-      );
+      // ✅ don't crash leaderboard if opened outside Telegram
+      console.warn("Auth missing in GLOBAL leaderboard:", e.message || e);
     }
 
-    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
+    const limit = Math.max(1, Math.min(200, Number((req.body && req.body.limit) || 100)));
 
     const lbRes = await pool.query(
       `
@@ -1256,7 +1326,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
       FROM users
       ORDER BY balance DESC, telegram_id ASC
       LIMIT $1;
-    `,
+      `,
       [limit]
     );
 
@@ -1298,13 +1368,10 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error(
-        "getOrCreateUserFromInitData failed in DAILY leaderboard:",
-        e.message || e
-      );
+      console.warn("Auth missing in DAILY leaderboard:", e.message || e);
     }
 
-    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
+    const limit = Math.max(1, Math.min(200, Number((req.body && req.body.limit) || 100)));
 
     const lbRes = await pool.query(
       `
@@ -1317,7 +1384,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       FROM users
       ORDER BY today_farmed DESC, telegram_id ASC
       LIMIT $1;
-    `,
+      `,
       [limit]
     );
 
@@ -1358,7 +1425,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
         myTid !== null
           ? {
               telegram_id: myTid,
-              today_farmed: Number(user.today_farmed || 0),
+              today_farmed: Number((user && user.today_farmed) || 0),
               daily_rank: myRank,
               daily_total: total,
             }
@@ -1378,10 +1445,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error(
-        "getOrCreateUserFromInitData failed in FRIENDS leaderboard:",
-        e.message || e
-      );
+      console.warn("Auth missing in FRIENDS leaderboard:", e.message || e);
     }
 
     if (!user || !user.telegram_id) {
@@ -1404,7 +1468,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
         END AS friend_id
       FROM referrals
       WHERE inviter_id = $1 OR invited_id = $1;
-    `,
+      `,
       [myTid]
     );
 
@@ -1419,7 +1483,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
       SELECT telegram_id, username, first_name, last_name, balance
       FROM users
       WHERE telegram_id = ANY($1::bigint[]);
-    `,
+      `,
       [idsForQuery]
     );
 
@@ -1462,6 +1526,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
+
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
@@ -1483,7 +1548,7 @@ bot.start(async (ctx) => {
         FROM users
         WHERE telegram_id = $1
         LIMIT 1;
-      `,
+        `,
         [telegramId]
       );
 
@@ -1500,7 +1565,7 @@ bot.start(async (ctx) => {
           )
           VALUES ($1, $2, $3, $4, $5)
           RETURNING *;
-        `,
+          `,
           [telegramId, username, firstName, lastName, languageCode]
         );
         user = insertRes.rows[0];
@@ -1511,9 +1576,7 @@ bot.start(async (ctx) => {
       const startPayload = ctx.startPayload;
       if (startPayload) {
         let payload = startPayload;
-        if (payload.startsWith("ref_")) {
-          payload = payload.slice(4);
-        }
+        if (payload.startsWith("ref_")) payload = payload.slice(4);
         const inviterId = Number(payload);
 
         if (inviterId && inviterId !== telegramId) {
@@ -1522,7 +1585,7 @@ bot.start(async (ctx) => {
             SELECT *
             FROM referrals
             WHERE inviter_id = $1 AND invited_id = $2;
-          `,
+            `,
             [inviterId, telegramId]
           );
 
@@ -1531,7 +1594,7 @@ bot.start(async (ctx) => {
               `
               INSERT INTO referrals (inviter_id, invited_id)
               VALUES ($1, $2);
-            `,
+              `,
               [inviterId, telegramId]
             );
 
@@ -1542,7 +1605,7 @@ bot.start(async (ctx) => {
                   referrals_count = referrals_count + 1,
                   referrals_points = referrals_points + $1
               WHERE telegram_id = $2;
-            `,
+              `,
               [REFERRAL_REWARD, inviterId]
             );
           }
@@ -1557,23 +1620,20 @@ bot.start(async (ctx) => {
       client.release();
     }
 
-    await ctx.reply(
-      "🔥 Welcome to Airdrop Empire!\n\nTap below to open the game 👇",
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: "🚀 Open Airdrop Empire",
-                web_app: {
-                  url: "https://resilient-kheer-041b8c.netlify.app",
-                },
+    await ctx.reply("🔥 Welcome to Airdrop Empire!\n\nTap below to open the game 👇", {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "🚀 Open Airdrop Empire",
+              web_app: {
+                url: "https://resilient-kheer-041b8c.netlify.app",
               },
-            ],
+            },
           ],
-        },
-      }
-    );
+        ],
+      },
+    });
   } catch (err) {
     console.error("Error in /start handler:", err);
     await ctx.reply("Something went wrong. Please try again later.");
@@ -1582,9 +1642,7 @@ bot.start(async (ctx) => {
 
 // Simple commands for debugging
 bot.command("tasks", async (ctx) => {
-  await ctx.reply(
-    "✨ Daily tasks coming soon.\nWe will add partner quests, socials & more."
-  );
+  await ctx.reply("✨ Daily tasks coming soon.\nWe will add partner quests, socials & more.");
 });
 
 bot.command("tap", async (ctx) => {
@@ -1596,9 +1654,7 @@ bot.command("tap", async (ctx) => {
           [
             {
               text: "🚀 Open Airdrop Empire",
-              web_app: {
-                url: "https://resilient-kheer-041b8c.netlify.app",
-              },
+              web_app: { url: "https://resilient-kheer-041b8c.netlify.app" },
             },
           ],
         ],
