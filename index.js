@@ -36,6 +36,12 @@ function todayDate() {
 // Referral reward per new friend (once, when they join)
 const REFERRAL_REWARD = 800;
 
+// Cost (in points) for paid energy refill boost
+const ENERGY_REFILL_COST = 500;
+
+// Cost (in points) for paid double-points boost (10 mins)
+const DOUBLE_BOOST_COST = 1000;
+
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
@@ -93,7 +99,7 @@ async function getOrCreateUserFromInitData(req) {
 
   const client = await pool.connect();
   try {
-    // Create tables if not exist (safe to run many times)
+    // ---------- Core tables ----------
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -110,19 +116,18 @@ async function getOrCreateUserFromInitData(req) {
         last_reset DATE,
         last_energy_ts TIMESTAMPTZ,
         taps_today INT DEFAULT 0,
-        referrals_count INT DEFAULT 0,
-        referrals_points BIGINT DEFAULT 0
+        referrals_count BIGINT DEFAULT 0,
+        referrals_points BIGINT DEFAULT 0,
+        double_boost_until TIMESTAMPTZ
       );
     `);
-
 
     await client.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
-      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
     `);
-
-
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS referrals (
@@ -134,7 +139,50 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
-    // Basic indexes to make leaderboards faster over time
+    // ---------- NEW: Missions + Ad sessions ----------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS missions (
+        id SERIAL PRIMARY KEY,
+        code TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        payout_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
+        payout_amount BIGINT DEFAULT 0,  -- used for 'points' (and for future flexible rewards)
+        url TEXT,
+        kind TEXT,                       -- 'ad', 'social', 'offerwall', 'pro'
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_missions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        mission_id INTEGER NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'started',  -- 'started', 'completed', 'verified'
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ,
+        verified_at TIMESTAMPTZ,
+        reward_applied BOOLEAN DEFAULT FALSE,
+        UNIQUE (user_id, mission_id)
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ad_sessions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        network TEXT,
+        reward_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
+        reward_amount BIGINT DEFAULT 0,  -- for 'points'; optional for others
+        status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'completed'
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+      );
+    `);
+
+    // Basic indexes to make leaderboards & lookups faster
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_balance
       ON users (balance DESC);
@@ -143,20 +191,23 @@ async function getOrCreateUserFromInitData(req) {
       CREATE INDEX IF NOT EXISTS idx_users_today
       ON users (today_farmed DESC);
     `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_user_missions_user
+      ON user_missions (user_id);
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_ad_sessions_user
+      ON ad_sessions (user_id);
+    `);
 
     // Upsert user
-    let res = await client.query(
-      `
-      SELECT *
-      FROM users
-      WHERE telegram_id = $1
-      LIMIT 1;
-    `,
+    const existing = await client.query(
+      `SELECT * FROM users WHERE telegram_id = $1 LIMIT 1;`,
       [telegramUserId]
     );
 
     let user;
-    if (res.rowCount === 0) {
+    if (existing.rowCount === 0) {
       const insertRes = await client.query(
         `
         INSERT INTO users (
@@ -172,16 +223,17 @@ async function getOrCreateUserFromInitData(req) {
           last_reset,
           taps_today,
           referrals_count,
-          referrals_points
+          referrals_points,
+          double_boost_until
         )
-        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0)
+        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0, NULL)
         RETURNING *;
       `,
         [telegramUserId, username, firstName, lastName, languageCode]
       );
       user = insertRes.rows[0];
     } else {
-      user = res.rows[0];
+      user = existing.rows[0];
     }
 
     return user;
@@ -195,10 +247,8 @@ async function applyEnergyRegen(user) {
   const maxEnergy = user.max_energy || 50;
   const now = new Date();
 
-  // If never had regen timestamp, pretend they've been away for a while
-  // so we can safely top them up.
+  // If never had regen timestamp → assume long offline
   if (!user.last_energy_ts) {
-    // Treat as if last update was 1 hour ago
     user.last_energy_ts = new Date(now.getTime() - 60 * 60 * 1000);
   }
 
@@ -211,21 +261,14 @@ async function applyEnergyRegen(user) {
   while (diffSeconds > 0 && energy < maxEnergy) {
     let step;
 
-    // Option C Hybrid formula
-    if (energy < 10) {
-      step = 1;   // 1 energy per second
-    } else if (energy < 30) {
-      step = 3;   // 1 energy per 3 seconds
-    } else {
-      step = 6;   // 1 energy per 6 seconds
-    }
+    if (energy < 10) step = 1;      // fast regen
+    else if (energy < 30) step = 3; // medium regen
+    else step = 6;                  // slow regen
 
     if (diffSeconds >= step) {
       energy += 1;
       diffSeconds -= step;
-    } else {
-      break;
-    }
+    } else break;
   }
 
   if (energy > maxEnergy) energy = maxEnergy;
@@ -246,99 +289,80 @@ async function applyEnergyRegen(user) {
   return user;
 }
 
-
-
-// ------------ Daily reset ------------
+// ------------ Daily reset logic ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
-
   let lastResetStr = null;
 
   try {
     if (user.last_reset) {
       if (typeof user.last_reset === "string") {
-        // e.g. '2025-12-10' or '2025-12-10T00:00:00.000Z'
         lastResetStr = user.last_reset.slice(0, 10);
-      } else if (user.last_reset instanceof Date && !isNaN(user.last_reset)) {
-        lastResetStr = user.last_reset.toISOString().slice(0, 10);
       } else {
         const tmp = new Date(user.last_reset);
-        if (!isNaN(tmp)) {
-          lastResetStr = tmp.toISOString().slice(0, 10);
-        }
+        if (!isNaN(tmp)) lastResetStr = tmp.toISOString().slice(0, 10);
       }
     }
   } catch (e) {
-    console.error("ensureDailyReset: bad last_reset value:", user.last_reset, e);
-    // Force a safe reset below
+    console.error("Bad last_reset:", user.last_reset, e);
     lastResetStr = null;
   }
 
-  // If same calendar day, nothing to do
-  if (lastResetStr === today) {
-    return user;
-  }
+  if (lastResetStr === today) return user;
 
-  // Different (or unknown) day → reset daily counters + refill energy
-  const res = await pool.query(
+  const updated = await pool.query(
     `
       UPDATE users
       SET today_farmed = 0,
-          taps_today   = 0,
-          energy       = max_energy,
-          last_reset   = $1
+          taps_today = 0,
+          energy = max_energy,
+          last_reset = $1
       WHERE id = $2
       RETURNING *;
     `,
     [today, user.id]
   );
 
-  return res.rows[0];
+  return updated.rows[0];
 }
 
-
-
-
-
-// ------------ Tap logic ------------
+// ------------ Legacy tap helper (kept for compatibility) ------------
 async function handleTap(user) {
-  const maxEnergy = 50;
-  const perTapBase = 1;
+  if (user.energy <= 0) return user;
 
-  if (user.energy <= 0) {
-    return user;
-  }
-
-  const nowDay = todayDate();
-
-  if (user.last_reset !== nowDay) {
+  if (todayDate() !== user.last_reset) {
     user = await ensureDailyReset(user);
   }
 
-  const maxTapsPerDay = 5000;
-  if (user.taps_today >= maxTapsPerDay) {
-    return user;
+  if (user.taps_today >= 5000) return user;
+
+  let perTap = 1;
+
+  if (
+    user.double_boost_until &&
+    new Date(user.double_boost_until) > new Date()
+  ) {
+    perTap = 2;
   }
 
-  const newBalance = Number(user.balance || 0) + perTapBase;
-  const newEnergy = Number(user.energy || 0) - 1;
-  const newToday = Number(user.today_farmed || 0) + perTapBase;
-  const newTapsToday = Number(user.taps_today || 0) + 1;
+  const newBalance = Number(user.balance) + perTap;
+  const newEnergy = Number(user.energy) - 1;
+  const newToday = Number(user.today_farmed) + perTap;
 
-  const upd = await pool.query(
+  const updated = await pool.query(
     `
     UPDATE users
     SET balance = $1,
         energy = $2,
         today_farmed = $3,
-        taps_today = $4
-    WHERE id = $5
+        taps_today = taps_today + 1
+    WHERE id = $4
     RETURNING *;
   `,
-    [newBalance, newEnergy, newToday, newTapsToday, user.id]
+    [newBalance, newEnergy, newToday, user.id]
   );
 
-  return upd.rows[0];
+  return updated.rows[0];
 }
 
 // ------------ Global rank helper ------------
@@ -346,32 +370,42 @@ async function getGlobalRankForUser(user) {
   const balance = Number(user.balance || 0);
 
   const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
-  const total = Number(totalRes.rows[0].count || 0);
+  const total = Number(totalRes.rows[0].count);
 
-  if (total === 0) {
-    return { rank: null, total: 0 };
-  }
+  if (total === 0) return { rank: null, total: 0 };
 
   const aboveRes = await pool.query(
     `
     SELECT COUNT(*) AS count
     FROM users
     WHERE balance > $1;
-  `,
+    `,
     [balance]
   );
 
-  const countAbove = Number(aboveRes.rows[0].count || 0);
-  const rank = countAbove + 1;
-
-  return { rank, total };
+  const countAbove = Number(aboveRes.rows[0].count);
+  return {
+    rank: countAbove + 1,
+    total,
+  };
 }
 
-// ------------ Client state builder ------------
-async function buildClientState(user) {
+// ------------ Build state for frontend ------------
+  async function buildClientState(user) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?start=ref_${user.telegram_id}`;
 
   const { rank, total } = await getGlobalRankForUser(user);
+
+  let doubleBoostActive = false;
+  let doubleBoostUntil = null;
+
+  if (user.double_boost_until) {
+    const until = new Date(user.double_boost_until);
+    if (!isNaN(until)) {
+      doubleBoostUntil = until.toISOString();
+      doubleBoostActive = until > new Date();
+    }
+  }
 
   return {
     ok: true,
@@ -383,9 +417,72 @@ async function buildClientState(user) {
     referrals_points: Number(user.referrals_points || 0),
     global_rank: rank,
     global_total: total,
+    double_boost_active: doubleBoostActive,
+    double_boost_until: doubleBoostUntil,
   };
 }
 
+
+// ------------ NEW: generic reward helpers ------------
+async function applyGenericReward(user, rewardType, rewardAmount) {
+  const type = rewardType || "points";
+  const amount = Number(rewardAmount || 0);
+  let updatedUser = user;
+
+  if (type === "points" && amount > 0) {
+    const res = await pool.query(
+      `
+      UPDATE users
+      SET balance = balance + $1
+      WHERE id = $2
+      RETURNING *;
+      `,
+      [amount, user.id]
+    );
+    updatedUser = res.rows[0];
+  } else if (type === "energy_refill") {
+    const res = await pool.query(
+      `
+      UPDATE users
+      SET energy = max_energy,
+          last_energy_ts = NOW()
+      WHERE id = $1
+      RETURNING *;
+      `,
+      [user.id]
+    );
+    updatedUser = res.rows[0];
+  } else if (type === "double_10m") {
+    const now = new Date();
+    const current =
+      user.double_boost_until && !isNaN(new Date(user.double_boost_until))
+        ? new Date(user.double_boost_until)
+        : now;
+    const base = current > now ? current : now;
+    const minutes = amount > 0 ? amount : 10;
+    const newUntil = new Date(base.getTime() + minutes * 60 * 1000);
+
+    const res = await pool.query(
+      `
+      UPDATE users
+      SET double_boost_until = $1
+      WHERE id = $2
+      RETURNING *;
+      `,
+      [newUntil.toISOString(), user.id]
+    );
+    updatedUser = res.rows[0];
+  } else {
+    // Unknown reward type – no-op for safety
+    console.warn("Unknown reward type:", type);
+  }
+
+  return updatedUser;
+}
+
+async function applyMissionReward(user, mission) {
+  return applyGenericReward(user, mission.payout_type, mission.payout_amount);
+}
 // ------------ Express Routes ------------
 
 // Health check
@@ -398,8 +495,8 @@ app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // ✅ Refill energy based on time passed
-    user = await applyEnergyRegen(user);   // ← ADD THIS LINE
+    // Refill energy based on time passed
+    user = await applyEnergyRegen(user);
 
     // Ensure daily counters reset if a new day started
     user = await ensureDailyReset(user);
@@ -412,24 +509,21 @@ app.post("/api/state", async (req, res) => {
   }
 });
 
-
-
-
 // DEBUG: GET state for a given telegram_id (for testing in browser)
 app.get("/api/state-debug", async (req, res) => {
   try {
-    // Always respond as plain text so it's easy to see in Safari
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
 
     res.write("STATE-DEBUG ROUTE REACHED\n");
-    res.write("query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n");
+    res.write(
+      "query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n"
+    );
 
     if (!req.query.telegram_id) {
       res.write("ERROR: MISSING_TELEGRAM_ID\n");
       return res.end();
     }
 
-    // Use dev fallback: pass telegram_id into our existing helper
     req.body = req.body || {};
     req.body.telegram_id = Number(req.query.telegram_id);
 
@@ -455,27 +549,25 @@ app.get("/api/state-debug", async (req, res) => {
   }
 });
 
-
-
-// Tap route – regen + spend 1 energy + add 1 point
+// Tap route – regen + spend 1 energy + add points (x2 if boost)
 app.post("/api/tap", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // ✅ 1) Refill energy first, based on last_energy_ts
+    // 1) Refill energy first, based on last_energy_ts
     user = await applyEnergyRegen(user);
 
-    // ✅ 2) New day? reset today_farmed, taps_today, and refill to max
+    // 2) New day? reset today_farmed, taps_today, and refill to max
     user = await ensureDailyReset(user);
 
-    // ✅ 3) If no energy, don't allow tap
+    // 3) If no energy, don't allow tap
     const currentEnergy = Number(user.energy || 0);
     if (currentEnergy <= 0) {
       const state = await buildClientState(user);
       return res.json({ ...state, ok: false, reason: "NO_ENERGY" });
     }
 
-    // ✅ 4) Daily tap cap
+    // 4) Daily tap cap
     const maxTapsPerDay = 5000;
     const currentTaps = Number(user.taps_today || 0);
     if (currentTaps >= maxTapsPerDay) {
@@ -483,21 +575,30 @@ app.post("/api/tap", async (req, res) => {
       return res.json({ ...state, ok: false, reason: "MAX_TAPS_REACHED" });
     }
 
-    // ✅ 5) Spend 1 energy + add 1 point
-    const perTapBase = 1;
+    // 5) Spend 1 energy + add points (double if boost still active)
+    const basePerTap = 1;
+    const now = new Date();
+    let perTap = basePerTap;
 
-    const newBalance = Number(user.balance || 0) + perTapBase;
-    const newEnergy  = currentEnergy - 1;
-    const newToday   = Number(user.today_farmed || 0) + perTapBase;
-    const newTaps    = currentTaps + 1;
+    if (user.double_boost_until) {
+      const until = new Date(user.double_boost_until);
+      if (!isNaN(until) && until > now) {
+        perTap = basePerTap * 2;
+      }
+    }
+
+    const newBalance = Number(user.balance || 0) + perTap;
+    const newEnergy = currentEnergy - 1;
+    const newToday = Number(user.today_farmed || 0) + perTap;
+    const newTaps = currentTaps + 1;
 
     const upd = await pool.query(
       `
       UPDATE users
-      SET balance       = $1,
-          energy        = $2,
-          today_farmed  = $3,
-          taps_today    = $4,
+      SET balance        = $1,
+          energy         = $2,
+          today_farmed   = $3,
+          taps_today     = $4,
           last_energy_ts = NOW()
       WHERE id = $5
       RETURNING *;
@@ -506,8 +607,6 @@ app.post("/api/tap", async (req, res) => {
     );
 
     const updatedUser = upd.rows[0];
-
-    // ✅ 6) Build client state from the *updated* row
     const state = await buildClientState(updatedUser);
     return res.json({ ...state, ok: true });
   } catch (err) {
@@ -516,9 +615,437 @@ app.post("/api/tap", async (req, res) => {
   }
 });
 
+// Energy boost – refill energy via action or by spending points (hybrid)
+app.post("/api/boost/energy", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
 
+    // Keep energy + daily stats in sync
+    user = await applyEnergyRegen(user);
+    user = await ensureDailyReset(user);
 
-// Daily task route (simple daily + backend sync)
+    const method = req.body.method === "points" ? "points" : "action";
+
+    const maxEnergy = Number(user.max_energy || 50);
+    const currentEnergy = Number(user.energy || 0);
+
+    if (currentEnergy >= maxEnergy) {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "ENERGY_FULL" });
+    }
+
+    let updatedUser;
+
+    if (method === "points") {
+      const currentBalance = Number(user.balance || 0);
+
+      if (currentBalance < ENERGY_REFILL_COST) {
+        const state = await buildClientState(user);
+        return res.json({
+          ...state,
+          ok: false,
+          reason: "NOT_ENOUGH_POINTS",
+        });
+      }
+
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET balance        = balance - $1,
+            energy         = max_energy,
+            last_energy_ts = NOW()
+        WHERE id = $2
+        RETURNING *;
+        `,
+        [ENERGY_REFILL_COST, user.id]
+      );
+      updatedUser = upd.rows[0];
+    } else {
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET energy         = max_energy,
+            last_energy_ts = NOW()
+        WHERE id = $1
+        RETURNING *;
+        `,
+        [user.id]
+      );
+      updatedUser = upd.rows[0];
+    }
+
+    const state = await buildClientState(updatedUser);
+    return res.json({
+      ...state,
+      ok: true,
+      message:
+        method === "points"
+          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
+          : "⚡ Free energy boost activated.",
+    });
+  } catch (err) {
+    console.error("Error /api/boost/energy:", err);
+    res.status(500).json({ ok: false, error: "BOOST_ENERGY_ERROR" });
+  }
+});
+
+// Double points boost – 10 minutes of x2 taps
+app.post("/api/boost/double", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+
+    // Keep regen + daily stats consistent
+    user = await applyEnergyRegen(user);
+    user = await ensureDailyReset(user);
+
+    const method = req.body.method === "points" ? "points" : "action";
+
+    let updatedUser;
+
+    if (method === "points") {
+      const currentBalance = Number(user.balance || 0);
+      if (currentBalance < DOUBLE_BOOST_COST) {
+        const state = await buildClientState(user);
+        return res.json({ ...state, ok: false, reason: "NOT_ENOUGH_POINTS" });
+      }
+
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET balance = balance - $1,
+            double_boost_until =
+              GREATEST(COALESCE(double_boost_until, NOW()), NOW()) + INTERVAL '10 minutes'
+        WHERE id = $2
+        RETURNING *;
+        `,
+        [DOUBLE_BOOST_COST, user.id]
+      );
+      updatedUser = upd.rows[0];
+    } else {
+      // "action" path – free sponsor-based boost
+      const upd = await pool.query(
+        `
+        UPDATE users
+        SET double_boost_until =
+              GREATEST(COALESCE(double_boost_until, NOW()), NOW()) + INTERVAL '10 minutes'
+        WHERE id = $1
+        RETURNING *;
+        `,
+        [user.id]
+      );
+      updatedUser = upd.rows[0];
+    }
+
+    const state = await buildClientState(updatedUser);
+
+    return res.json({
+      ...state,
+      ok: true,
+      message:
+        method === "points"
+          ? `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
+          : "✨ Free double points boost activated!",
+    });
+  } catch (err) {
+    console.error("Error /api/boost/double:", err);
+    res.status(500).json({ ok: false, error: "BOOST_DOUBLE_ERROR" });
+  }
+});
+
+// ------------ NEW: Missions API ------------
+
+// List active missions + user status
+app.post("/api/mission/list", async (req, res) => {
+  try {
+    const user = await getOrCreateUserFromInitData(req);
+    const kind = req.body.kind || null;
+
+    const params = [];
+    let where = "WHERE is_active = TRUE";
+    if (kind) {
+      params.push(kind);
+      where += ` AND kind = $${params.length}`;
+    }
+
+    const missionsRes = await pool.query(
+      `
+      SELECT id, code, title, description, payout_type, payout_amount, url, kind
+      FROM missions
+      ${where}
+      ORDER BY id ASC;
+      `,
+      params
+    );
+
+    const missionIds = missionsRes.rows.map((m) => m.id);
+    let userMissionMap = {};
+    if (missionIds.length > 0) {
+      const umRes = await pool.query(
+        `
+        SELECT mission_id, status, reward_applied
+        FROM user_missions
+        WHERE user_id = $1 AND mission_id = ANY($2::int[]);
+        `,
+        [user.id, missionIds]
+      );
+      userMissionMap = umRes.rows.reduce((acc, r) => {
+        acc[r.mission_id] = {
+          status: r.status,
+          reward_applied: r.reward_applied,
+        };
+        return acc;
+      }, {});
+    }
+
+    const missions = missionsRes.rows.map((m) => {
+      const um = userMissionMap[m.id];
+      return {
+        code: m.code,
+        title: m.title,
+        description: m.description,
+        payout_type: m.payout_type,
+        payout_amount: Number(m.payout_amount || 0),
+        url: m.url,
+        kind: m.kind,
+        status: um ? um.status : "not_started",
+        reward_applied: um ? um.reward_applied : false,
+      };
+    });
+
+    res.json({
+      ok: true,
+      missions,
+    });
+  } catch (err) {
+    console.error("Error /api/mission/list:", err);
+    res.status(500).json({ ok: false, error: "MISSION_LIST_ERROR" });
+  }
+});
+
+// Start a mission (returns redirect URL)
+app.post("/api/mission/start", async (req, res) => {
+  try {
+    const user = await getOrCreateUserFromInitData(req);
+    const code = (req.body.code || "").trim();
+
+    if (!code) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "MISSING_MISSION_CODE" });
+    }
+
+    const missionRes = await pool.query(
+      `
+      SELECT *
+      FROM missions
+      WHERE code = $1 AND is_active = TRUE
+      LIMIT 1;
+      `,
+      [code]
+    );
+
+    if (missionRes.rowCount === 0) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "MISSION_NOT_FOUND_OR_INACTIVE" });
+    }
+
+    const mission = missionRes.rows[0];
+
+    await pool.query(
+      `
+      INSERT INTO user_missions (user_id, mission_id, status, started_at)
+      VALUES ($1, $2, 'started', NOW())
+      ON CONFLICT (user_id, mission_id)
+      DO UPDATE SET
+        status = 'started',
+        started_at = COALESCE(user_missions.started_at, NOW());
+      `,
+      [user.id, mission.id]
+    );
+
+    res.json({
+      ok: true,
+      code: mission.code,
+      redirect_url: mission.url,
+    });
+  } catch (err) {
+    console.error("Error /api/mission/start:", err);
+    res.status(500).json({ ok: false, error: "MISSION_START_ERROR" });
+  }
+});
+
+// Complete a mission (MVP: trust client)
+app.post("/api/mission/complete", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+    const code = (req.body.code || "").trim();
+
+    if (!code) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "MISSING_MISSION_CODE" });
+    }
+
+    const missionRes = await pool.query(
+      `
+      SELECT *
+      FROM missions
+      WHERE code = $1
+      LIMIT 1;
+      `,
+      [code]
+    );
+
+    if (missionRes.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "MISSION_NOT_FOUND" });
+    }
+
+    const mission = missionRes.rows[0];
+
+    const umRes = await pool.query(
+      `
+      INSERT INTO user_missions (user_id, mission_id, status, started_at, completed_at)
+      VALUES ($1, $2, 'completed', NOW(), NOW())
+      ON CONFLICT (user_id, mission_id)
+      DO UPDATE SET
+        status = 'completed',
+        completed_at = COALESCE(user_missions.completed_at, NOW())
+      RETURNING *;
+      `,
+      [user.id, mission.id]
+    );
+
+    const userMission = umRes.rows[0];
+
+    if (!userMission.reward_applied) {
+      user = await applyMissionReward(user, mission);
+
+      await pool.query(
+        `
+        UPDATE user_missions
+        SET reward_applied = TRUE,
+            verified_at = NOW()
+        WHERE id = $1;
+        `,
+        [userMission.id]
+      );
+    }
+
+    const state = await buildClientState(user);
+    res.json({
+      ...state,
+      ok: true,
+      mission: {
+        code: mission.code,
+        status: "completed",
+        reward_applied: true,
+      },
+    });
+  } catch (err) {
+    console.error("Error /api/mission/complete:", err);
+    res.status(500).json({ ok: false, error: "MISSION_COMPLETE_ERROR" });
+  }
+});
+
+// ------------ NEW: Rewarded Ad helper endpoints ------------
+
+// Create an ad session (front-end calls before showing video/ad)
+app.post("/api/boost/requestAd", async (req, res) => {
+  try {
+    const user = await getOrCreateUserFromInitData(req);
+
+    const rewardType = req.body.reward_type || "energy_refill"; // 'points', 'energy_refill', 'double_10m'
+    const rewardAmount = Number(req.body.reward_amount || 0);
+    const network = req.body.network || null;
+
+    const validTypes = ["points", "energy_refill", "double_10m"];
+    if (!validTypes.includes(rewardType)) {
+      return res.status(400).json({ ok: false, error: "BAD_REWARD_TYPE" });
+    }
+
+    const adRes = await pool.query(
+      `
+      INSERT INTO ad_sessions (user_id, network, reward_type, reward_amount, status)
+      VALUES ($1, $2, $3, $4, 'pending')
+      RETURNING id, reward_type, reward_amount;
+      `,
+      [user.id, network, rewardType, rewardAmount]
+    );
+
+    const session = adRes.rows[0];
+
+    res.json({
+      ok: true,
+      ad_session_id: session.id,
+      reward_type: session.reward_type,
+      reward_amount: Number(session.reward_amount || 0),
+    });
+  } catch (err) {
+    console.error("Error /api/boost/requestAd:", err);
+    res.status(500).json({ ok: false, error: "REQUEST_AD_ERROR" });
+  }
+});
+
+// Mark ad session as completed & apply reward
+app.post("/api/boost/completeAd", async (req, res) => {
+  try {
+    let user = await getOrCreateUserFromInitData(req);
+    const sessionId = Number(req.body.ad_session_id || 0);
+
+    if (!sessionId) {
+      return res.status(400).json({ ok: false, error: "MISSING_SESSION_ID" });
+    }
+
+    const adRes = await pool.query(
+      `
+      SELECT *
+      FROM ad_sessions
+      WHERE id = $1 AND user_id = $2 AND status = 'pending'
+      LIMIT 1;
+      `,
+      [sessionId, user.id]
+    );
+
+    if (adRes.rowCount === 0) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "AD_SESSION_NOT_FOUND_OR_USED" });
+    }
+
+    const ad = adRes.rows[0];
+
+    // Apply reward via same generic engine as missions
+    user = await applyGenericReward(user, ad.reward_type, ad.reward_amount);
+
+    await pool.query(
+      `
+      UPDATE ad_sessions
+      SET status = 'completed',
+          completed_at = NOW()
+      WHERE id = $1;
+      `,
+      [ad.id]
+    );
+
+    const state = await buildClientState(user);
+
+    res.json({
+      ...state,
+      ok: true,
+      message: "🎁 Ad reward applied.",
+    });
+  } catch (err) {
+    console.error("Error /api/boost/completeAd:", err);
+    res.status(500).json({ ok: false, error: "COMPLETE_AD_ERROR" });
+  }
+});
+
+// Daily task route (simple daily + backend sync, FIXED one-claim-per-day)
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
@@ -528,9 +1055,26 @@ app.post("/api/task", async (req, res) => {
       return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
     }
 
-    const today = todayDate();
+    const today = todayDate(); // "YYYY-MM-DD"
 
-    if (user.last_daily !== today) {
+    // Normalise last_daily (can be Date or null)
+    let lastDailyStr = null;
+    try {
+      if (user.last_daily) {
+        if (typeof user.last_daily === "string") {
+          lastDailyStr = user.last_daily.slice(0, 10);
+        } else {
+          const d = new Date(user.last_daily);
+          if (!isNaN(d)) lastDailyStr = d.toISOString().slice(0, 10);
+        }
+      }
+    } catch (e) {
+      console.error("Bad last_daily:", user.last_daily, e);
+      lastDailyStr = null;
+    }
+
+    // Only reward if today is different from last_daily
+    if (lastDailyStr !== today) {
       const reward = Number(req.body.reward || 1000);
       const newBalance = Number(user.balance || 0) + reward;
 
@@ -541,7 +1085,7 @@ app.post("/api/task", async (req, res) => {
             last_daily = $2
         WHERE id = $3
         RETURNING *;
-      `,
+        `,
         [newBalance, today, user.id]
       );
       user = upd.rows[0];
@@ -554,6 +1098,7 @@ app.post("/api/task", async (req, res) => {
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
 });
+
 
 // Friends summary (kept for existing front-end)
 app.post("/api/friends", async (req, res) => {
@@ -582,21 +1127,20 @@ app.post("/api/withdraw/info", async (req, res) => {
   }
 });
 
-// ------------ NEW: Global leaderboard ------------
-
+// ------------ Global leaderboard ------------
 app.post("/api/leaderboard/global", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error("getOrCreateUserFromInitData failed in GLOBAL leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in GLOBAL leaderboard:",
+        e.message || e
+      );
     }
 
-    const limit = Math.max(
-      1,
-      Math.min(200, Number(req.body.limit || 100))
-    );
+    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
 
     const lbRes = await pool.query(
       `
@@ -623,7 +1167,6 @@ app.post("/api/leaderboard/global", async (req, res) => {
     }));
 
     let me = null;
-    let total = null;
     if (user && user.telegram_id) {
       const rankInfo = await getGlobalRankForUser(user);
       me = {
@@ -632,7 +1175,6 @@ app.post("/api/leaderboard/global", async (req, res) => {
         global_rank: rankInfo.rank,
         global_total: rankInfo.total,
       };
-      total = rankInfo.total;
     }
 
     res.json({
@@ -646,24 +1188,21 @@ app.post("/api/leaderboard/global", async (req, res) => {
   }
 });
 
-
-
-// ------------ NEW: Daily leaderboard (today_farmed) ------------
+// ------------ Daily leaderboard (today_farmed) ------------
 app.post("/api/leaderboard/daily", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error("getOrCreateUserFromInitData failed in DAILY leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in DAILY leaderboard:",
+        e.message || e
+      );
     }
 
-    const limit = Math.max(
-      1,
-      Math.min(200, Number(req.body.limit || 100))
-    );
+    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
 
-    // Top daily farmers by today_farmed
     const lbRes = await pool.query(
       `
       SELECT
@@ -688,13 +1227,11 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       daily_rank: idx + 1,
     }));
 
-    // Total players (for context)
     const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM users;`);
     const total = Number(totalRes.rows[0].count || 0);
 
     const myTid = user && user.telegram_id ? Number(user.telegram_id) : null;
 
-    // Compute my daily rank even if I'm not in the top N
     let myRank = null;
     if (myTid !== null && total > 0) {
       const myRowRes = await pool.query(
@@ -714,14 +1251,15 @@ app.post("/api/leaderboard/daily", async (req, res) => {
 
     res.json({
       ok: true,
-      me: myTid !== null
-        ? {
-            telegram_id: myTid,
-            today_farmed: Number(user.today_farmed || 0),
-            daily_rank: myRank,
-            daily_total: total,
-          }
-        : null,
+      me:
+        myTid !== null
+          ? {
+              telegram_id: myTid,
+              today_farmed: Number(user.today_farmed || 0),
+              daily_rank: myRank,
+              daily_total: total,
+            }
+          : null,
       daily: rows,
     });
   } catch (err) {
@@ -730,20 +1268,20 @@ app.post("/api/leaderboard/daily", async (req, res) => {
   }
 });
 
-
-// ------------ NEW: Friends leaderboard (you + referred friends) ------------
-
+// ------------ Friends leaderboard ------------
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.error("getOrCreateUserFromInitData failed in FRIENDS leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in FRIENDS leaderboard:",
+        e.message || e
+      );
     }
 
     if (!user || !user.telegram_id) {
-      // No user context -> return empty friends list but keep request successful
       return res.json({
         ok: true,
         me: null,
@@ -771,8 +1309,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
       .map((r) => Number(r.friend_id))
       .filter((v) => !!v && v !== myTid);
 
-    const idsForQuery =
-      friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
+    const idsForQuery = friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
 
     const usersRes = await pool.query(
       `
@@ -822,7 +1359,6 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
-
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
@@ -976,7 +1512,7 @@ bot.command("referral", async (ctx) => {
   );
 });
 
-// ------------ Launch ------------
+// ------------ Launch (with 409-safe bot startup) ------------
 async function start() {
   const PORT = process.env.PORT || 3000;
 
@@ -984,8 +1520,24 @@ async function start() {
     console.log(`🌐 Express API running on port ${PORT}`);
   });
 
-  await bot.launch();
-  console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
+  try {
+    await bot.launch();
+    console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
+  } catch (err) {
+    if (
+      (err && err.code === 409) ||
+      (err && err.response && err.response.error_code === 409) ||
+      String(err).includes("409")
+    ) {
+      console.error(
+        "⚠️ TelegramError 409: another getUpdates is already running. " +
+          "Bot polling disabled for this instance, API will still work."
+      );
+    } else {
+      console.error("Fatal bot launch error:", err);
+      process.exit(1);
+    }
+  }
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
