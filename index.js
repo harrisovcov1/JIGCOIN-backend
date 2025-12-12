@@ -13,6 +13,9 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_USERNAME = process.env.BOT_USERNAME || "AirdropEmpireAppBot";
 
+// Render / scaling safe: set DISABLE_BOT_POLLING=1 to stop 409 conflicts
+const DISABLE_BOT_POLLING = String(process.env.DISABLE_BOT_POLLING || "").trim() === "1";
+
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN is missing");
   process.exit(1);
@@ -49,157 +52,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ------------ NEW: one-time schema init (prevents repeat DDL + race conditions) ------------
-let __schemaInitPromise = null;
-
-async function ensureSchema(client) {
-  if (__schemaInitPromise) return __schemaInitPromise;
-
-  __schemaInitPromise = (async () => {
-    // ---------- Core tables ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS public.users (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        language_code TEXT,
-        balance BIGINT DEFAULT 0,
-        energy INT DEFAULT 50,
-        max_energy INT DEFAULT 50,
-        today_farmed BIGINT DEFAULT 0,
-        last_daily DATE,
-        last_reset DATE,
-        last_energy_ts TIMESTAMPTZ,
-        taps_today INT DEFAULT 0,
-        referrals_count BIGINT DEFAULT 0,
-        referrals_points BIGINT DEFAULT 0,
-        double_boost_until TIMESTAMPTZ
-      );
-    `);
-
-    // Ensure columns exist (safe on existing DB)
-    await client.query(`
-      ALTER TABLE public.users
-      ADD COLUMN IF NOT EXISTS telegram_id BIGINT,
-      ADD COLUMN IF NOT EXISTS username TEXT,
-      ADD COLUMN IF NOT EXISTS first_name TEXT,
-      ADD COLUMN IF NOT EXISTS last_name TEXT,
-      ADD COLUMN IF NOT EXISTS language_code TEXT,
-      ADD COLUMN IF NOT EXISTS balance BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS energy INT DEFAULT 50,
-      ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
-      ADD COLUMN IF NOT EXISTS today_farmed BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_daily DATE,
-      ADD COLUMN IF NOT EXISTS last_reset DATE,
-      ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS taps_today INT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS referrals_count BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS referrals_points BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
-    `);
-
-    // Uniqueness for telegram_id (index is safest vs constraint name collisions)
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS users_telegram_id_unique
-      ON public.users (telegram_id);
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS public.referrals (
-        id SERIAL PRIMARY KEY,
-        inviter_id BIGINT NOT NULL,
-        invited_id BIGINT NOT NULL,
-        created_at TIMESTAMP DEFAULT NOW(),
-        UNIQUE (inviter_id, invited_id)
-      );
-    `);
-
-    // ---------- Missions ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS public.missions (
-        id SERIAL PRIMARY KEY,
-        description TEXT,
-        payout_type TEXT,
-        payout_amount BIGINT,
-        url TEXT,
-        kind TEXT,
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-
-    // Align missions with your new columns (code + title) and required defaults
-    await client.query(`
-      ALTER TABLE public.missions
-      ADD COLUMN IF NOT EXISTS code TEXT,
-      ADD COLUMN IF NOT EXISTS title TEXT,
-      ADD COLUMN IF NOT EXISTS description TEXT,
-      ADD COLUMN IF NOT EXISTS payout_type TEXT,
-      ADD COLUMN IF NOT EXISTS payout_amount BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS url TEXT,
-      ADD COLUMN IF NOT EXISTS kind TEXT,
-      ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
-    `);
-
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS missions_code_unique
-      ON public.missions (code);
-    `);
-
-    // ---------- User Missions ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS public.user_missions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-        mission_id INTEGER NOT NULL REFERENCES public.missions(id) ON DELETE CASCADE,
-        status TEXT NOT NULL DEFAULT 'started',
-        started_at TIMESTAMPTZ DEFAULT NOW(),
-        completed_at TIMESTAMPTZ,
-        verified_at TIMESTAMPTZ,
-        reward_applied BOOLEAN DEFAULT FALSE,
-        UNIQUE (user_id, mission_id)
-      );
-    `);
-
-    // ---------- Ad sessions ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS public.ad_sessions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
-        network TEXT,
-        reward_type TEXT NOT NULL,
-        reward_amount BIGINT DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        completed_at TIMESTAMPTZ
-      );
-    `);
-
-    // Indexes
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_users_balance
-      ON public.users (balance DESC);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_users_today
-      ON public.users (today_farmed DESC);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_user_missions_user
-      ON public.user_missions (user_id);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_ad_sessions_user
-      ON public.ad_sessions (user_id);
-    `);
-  })();
-
-  return __schemaInitPromise;
-}
-
 // ------------ Mini-app auth helper ------------
 function parseInitData(initDataRaw) {
   if (!initDataRaw) return {};
@@ -209,6 +61,99 @@ function parseInitData(initDataRaw) {
     data[key] = value;
   }
   return data;
+}
+
+// ------------ Ensure Supabase schema exists (SAFE) ------------
+async function ensureSchema(client) {
+  // Ensure users has the columns our backend needs (keeps your existing Supabase columns too)
+  await client.query(`
+    ALTER TABLE public.users
+    ADD COLUMN IF NOT EXISTS telegram_id BIGINT;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS users_telegram_id_unique
+    ON public.users (telegram_id);
+
+    ALTER TABLE public.users
+    ADD COLUMN IF NOT EXISTS username TEXT,
+    ADD COLUMN IF NOT EXISTS first_name TEXT,
+    ADD COLUMN IF NOT EXISTS last_name TEXT,
+    ADD COLUMN IF NOT EXISTS language_code TEXT,
+    ADD COLUMN IF NOT EXISTS balance BIGINT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS energy INT DEFAULT 50,
+    ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
+    ADD COLUMN IF NOT EXISTS today_farmed BIGINT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS last_daily DATE,
+    ADD COLUMN IF NOT EXISTS last_reset DATE,
+    ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS taps_today INT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS referrals_count BIGINT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS referrals_points BIGINT DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
+  `);
+
+  // Referrals (telegram_id based)
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public.referrals (
+      id SERIAL PRIMARY KEY,
+      inviter_id BIGINT NOT NULL,
+      invited_id BIGINT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (inviter_id, invited_id)
+    );
+  `);
+
+  // Missions
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public.missions (
+      id SERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      payout_type TEXT NOT NULL,
+      payout_amount BIGINT DEFAULT 0,
+      url TEXT,
+      kind TEXT,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // User missions (user_id references public.users.id)
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public.user_missions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      mission_id INTEGER NOT NULL REFERENCES public.missions(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'started',
+      started_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ,
+      verified_at TIMESTAMPTZ,
+      reward_applied BOOLEAN DEFAULT FALSE,
+      UNIQUE (user_id, mission_id)
+    );
+  `);
+
+  // Ad sessions
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS public.ad_sessions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+      network TEXT,
+      reward_type TEXT NOT NULL,
+      reward_amount BIGINT DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    );
+  `);
+
+  // Indexes
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_users_balance ON public.users (balance DESC);
+    CREATE INDEX IF NOT EXISTS idx_users_today ON public.users (today_farmed DESC);
+    CREATE INDEX IF NOT EXISTS idx_user_missions_user ON public.user_missions (user_id);
+    CREATE INDEX IF NOT EXISTS idx_ad_sessions_user ON public.ad_sessions (user_id);
+  `);
 }
 
 // Get or create a user from Telegram initData / dev fallback
@@ -250,46 +195,41 @@ async function getOrCreateUserFromInitData(req) {
 
   const client = await pool.connect();
   try {
-    // ✅ schema init once (safe)
     await ensureSchema(client);
 
-    // Upsert user
-    const existing = await client.query(
-      `SELECT * FROM public.users WHERE telegram_id = $1 LIMIT 1;`,
-      [telegramUserId]
+    // Upsert user by telegram_id into public.users
+    const upsertRes = await client.query(
+      `
+      INSERT INTO public.users (
+        telegram_id,
+        username,
+        first_name,
+        last_name,
+        language_code,
+        balance,
+        energy,
+        max_energy,
+        today_farmed,
+        last_daily,
+        last_reset,
+        taps_today,
+        referrals_count,
+        referrals_points,
+        double_boost_until
+      )
+      VALUES ($1, $2, $3, $4, $5, 0, 50, 50, 0, NULL, NULL, 0, 0, 0, NULL)
+      ON CONFLICT (telegram_id)
+      DO UPDATE SET
+        username = COALESCE(EXCLUDED.username, public.users.username),
+        first_name = COALESCE(EXCLUDED.first_name, public.users.first_name),
+        last_name = COALESCE(EXCLUDED.last_name, public.users.last_name),
+        language_code = COALESCE(EXCLUDED.language_code, public.users.language_code)
+      RETURNING *;
+      `,
+      [telegramUserId, username, firstName, lastName, languageCode]
     );
 
-    let user;
-    if (existing.rowCount === 0) {
-      const insertRes = await client.query(
-        `
-        INSERT INTO public.users (
-          telegram_id,
-          username,
-          first_name,
-          last_name,
-          language_code,
-          balance,
-          energy,
-          today_farmed,
-          last_daily,
-          last_reset,
-          taps_today,
-          referrals_count,
-          referrals_points,
-          double_boost_until
-        )
-        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0, NULL)
-        RETURNING *;
-      `,
-        [telegramUserId, username, firstName, lastName, languageCode]
-      );
-      user = insertRes.rows[0];
-    } else {
-      user = existing.rows[0];
-    }
-
-    return user;
+    return upsertRes.rows[0];
   } finally {
     client.release();
   }
@@ -341,6 +281,7 @@ async function applyEnergyRegen(user) {
 
   return user;
 }
+
 // ------------ Daily reset logic ------------
 async function ensureDailyReset(user) {
   const today = todayDate();
@@ -416,7 +357,6 @@ async function handleTap(user) {
 
   return updated.rows[0];
 }
-
 // ------------ Global rank helper ------------
 async function getGlobalRankForUser(user) {
   const balance = Number(user.balance || 0);
@@ -443,7 +383,7 @@ async function getGlobalRankForUser(user) {
 }
 
 // ------------ Build state for frontend ------------
-  async function buildClientState(user) {
+async function buildClientState(user) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?start=ref_${user.telegram_id}`;
 
   const { rank, total } = await getGlobalRankForUser(user);
@@ -473,7 +413,6 @@ async function getGlobalRankForUser(user) {
     double_boost_until: doubleBoostUntil,
   };
 }
-
 
 // ------------ NEW: generic reward helpers ------------
 async function applyGenericReward(user, rewardType, rewardAmount) {
@@ -535,6 +474,7 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
 async function applyMissionReward(user, mission) {
   return applyGenericReward(user, mission.payout_type, mission.payout_amount);
 }
+
 // ------------ Express Routes ------------
 
 // Health check
@@ -1150,7 +1090,6 @@ app.post("/api/task", async (req, res) => {
   }
 });
 
-
 // Friends summary (kept for existing front-end)
 app.post("/api/friends", async (req, res) => {
   try {
@@ -1410,6 +1349,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
   }
 });
+
 // ------------ Telegram Bot Handlers ------------
 
 // /start – handle possible referral
@@ -1425,39 +1365,24 @@ bot.start(async (ctx) => {
     try {
       await client.query("BEGIN");
 
-      // ✅ ensure schema exists before bot writes
       await ensureSchema(client);
 
-      let res = await client.query(
+      const upsertRes = await client.query(
         `
-        SELECT *
-        FROM public.users
-        WHERE telegram_id = $1
-        LIMIT 1;
-      `,
-        [telegramId]
+        INSERT INTO public.users (telegram_id, username, first_name, last_name, language_code)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (telegram_id)
+        DO UPDATE SET
+          username = COALESCE(EXCLUDED.username, public.users.username),
+          first_name = COALESCE(EXCLUDED.first_name, public.users.first_name),
+          last_name = COALESCE(EXCLUDED.last_name, public.users.last_name),
+          language_code = COALESCE(EXCLUDED.language_code, public.users.language_code)
+        RETURNING *;
+        `,
+        [telegramId, username, firstName, lastName, languageCode]
       );
 
-      let user;
-      if (res.rowCount === 0) {
-        const insertRes = await client.query(
-          `
-          INSERT INTO public.users (
-            telegram_id,
-            username,
-            first_name,
-            last_name,
-            language_code
-          )
-          VALUES ($1, $2, $3, $4, $5)
-          RETURNING *;
-        `,
-          [telegramId, username, firstName, lastName, languageCode]
-        );
-        user = insertRes.rows[0];
-      } else {
-        user = res.rows[0];
-      }
+      const user = upsertRes.rows[0];
 
       const startPayload = ctx.startPayload;
       if (startPayload) {
@@ -1574,22 +1499,26 @@ async function start() {
     console.log(`🌐 Express API running on port ${PORT}`);
   });
 
-  try {
-    await bot.launch();
-    console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
-  } catch (err) {
-    if (
-      (err && err.code === 409) ||
-      (err && err.response && err.response.error_code === 409) ||
-      String(err).includes("409")
-    ) {
-      console.error(
-        "⚠️ TelegramError 409: another getUpdates is already running. " +
-          "Bot polling disabled for this instance, API will still work."
-      );
-    } else {
-      console.error("Fatal bot launch error:", err);
-      process.exit(1);
+  if (DISABLE_BOT_POLLING) {
+    console.log("🤖 Bot polling disabled (DISABLE_BOT_POLLING=1). API will still work.");
+  } else {
+    try {
+      await bot.launch();
+      console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
+    } catch (err) {
+      if (
+        (err && err.code === 409) ||
+        (err && err.response && err.response.error_code === 409) ||
+        String(err).includes("409")
+      ) {
+        console.error(
+          "⚠️ TelegramError 409: another getUpdates is already running. " +
+            "Bot polling disabled for this instance, API will still work."
+        );
+      } else {
+        console.error("Fatal bot launch error:", err);
+        process.exit(1);
+      }
     }
   }
 
