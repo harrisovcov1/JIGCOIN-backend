@@ -1,5 +1,5 @@
 // index.js
-// Airdrop Empire – Backend Engine (leaderboards + referrals + tasks + missions)
+// Airdrop Empire – Backend Engine (leaderboards + referrals + tasks)
 //
 // Stack: Express API + Telegraf bot + Postgres (Supabase-style via pg.Pool)
 
@@ -28,16 +28,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Small helpers
+// Small helper
 function todayDate() {
-  // UTC YYYY-MM-DD
-  return new Date().toISOString().slice(0, 10);
-}
-
-function yesterdayDate() {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - 1);
-  return d.toISOString().slice(0, 10);
+  return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
 // Referral reward per new friend (once, when they join)
@@ -56,21 +49,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ------------ Auth / Errors ------------
-function makeAuthError(code, message) {
-  const e = new Error(message || code);
-  e.code = code;
-  return e;
-}
-
-function sendAuthError(res, err) {
-  // For missing Telegram identity, always return 401 so frontend can handle it cleanly.
-  if (err && err.code === "MISSING_TELEGRAM_ID") {
-    return res.status(401).json({ ok: false, error: "MISSING_TELEGRAM_ID" });
-  }
-  return null;
-}
-
 // ------------ Mini-app auth helper ------------
 function parseInitData(initDataRaw) {
   if (!initDataRaw) return {};
@@ -82,23 +60,9 @@ function parseInitData(initDataRaw) {
   return data;
 }
 
-function coerceTelegramId(v) {
-  if (v === undefined || v === null || v === "") return null;
-  const n = Number(v);
-  if (Number.isNaN(n) || !Number.isFinite(n)) return null;
-  if (n <= 0) return null;
-  // Telegram user IDs can exceed 32-bit; we keep as Number in JS but store BIGINT in DB.
-  return n;
-}
-
-// Get or create a user from Telegram initData / dev fallback (NOW MUCH MORE ROBUST)
+// Get or create a user from Telegram initData / dev fallback
 async function getOrCreateUserFromInitData(req) {
-  const initDataRaw =
-    (req.body && req.body.initData) ||
-    (req.query && req.query.initData) ||
-    (req.headers && req.headers["x-telegram-initdata"]) ||
-    "";
-
+  const initDataRaw = req.body.initData || req.query.initData || "";
   const data = parseInitData(initDataRaw);
 
   let telegramUserId = null;
@@ -107,11 +71,10 @@ async function getOrCreateUserFromInitData(req) {
   let lastName = null;
   let languageCode = null;
 
-  // 1) Preferred: Telegram initData user payload
   if (data.user) {
     try {
       const u = JSON.parse(data.user);
-      telegramUserId = coerceTelegramId(u.id);
+      telegramUserId = u.id;
       username = u.username || null;
       firstName = u.first_name || null;
       lastName = u.last_name || null;
@@ -121,33 +84,22 @@ async function getOrCreateUserFromInitData(req) {
     }
   }
 
-  // 2) Fallbacks: accept telegram_id from body/query/header (covers your current broken clients)
+  // DEV fallback: allow telegram_id in body or query
   if (!telegramUserId) {
-    const candidates = [
-      req.body && req.body.telegram_id,
-      req.body && req.body.telegramId,
-      req.query && req.query.telegram_id,
-      req.query && req.query.telegramId,
-      req.headers && req.headers["x-telegram-id"],
-      req.headers && req.headers["x-telegramid"],
-    ];
-
-    for (const c of candidates) {
-      const tid = coerceTelegramId(c);
-      if (tid) {
-        telegramUserId = tid;
-        break;
-      }
+    if (req.body.telegram_id) {
+      telegramUserId = Number(req.body.telegram_id);
+    } else if (req.query.telegram_id) {
+      telegramUserId = Number(req.query.telegram_id);
     }
   }
 
   if (!telegramUserId) {
-    throw makeAuthError("MISSING_TELEGRAM_ID", "Missing Telegram user ID");
+    throw new Error("Missing Telegram user ID");
   }
 
   const client = await pool.connect();
   try {
-    // ---------- Core tables ----------
+    // Create tables if not exist
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -166,18 +118,16 @@ async function getOrCreateUserFromInitData(req) {
         taps_today INT DEFAULT 0,
         referrals_count BIGINT DEFAULT 0,
         referrals_points BIGINT DEFAULT 0,
-        double_boost_until TIMESTAMPTZ,
-        streak_days INT DEFAULT 0
+        double_boost_until TIMESTAMPTZ
       );
     `);
 
-    // Safety alter (idempotent)
+    // Ensure new columns exist
     await client.query(`
       ALTER TABLE users
       ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
       ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS streak_days INT DEFAULT 0;
+      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
     `);
 
     await client.query(`
@@ -190,62 +140,6 @@ async function getOrCreateUserFromInitData(req) {
       );
     `);
 
-    // ---------- Missions + Ad sessions ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS missions (
-        id SERIAL PRIMARY KEY,
-        code TEXT UNIQUE NOT NULL,
-        title TEXT NOT NULL,
-        description TEXT,
-        payout_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
-        payout_amount BIGINT DEFAULT 0,  -- used for 'points' (and flexible rewards)
-        url TEXT,
-        kind TEXT,                       -- 'ad', 'social', 'offerwall', 'pro'
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS user_missions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        mission_id INTEGER NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-        status TEXT NOT NULL DEFAULT 'started',  -- 'started', 'completed', 'verified'
-        started_at TIMESTAMPTZ DEFAULT NOW(),
-        completed_at TIMESTAMPTZ,
-        verified_at TIMESTAMPTZ,
-        reward_applied BOOLEAN DEFAULT FALSE,
-        UNIQUE (user_id, mission_id)
-      );
-    `);
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS ad_sessions (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        network TEXT,
-        reward_type TEXT NOT NULL,       -- 'points', 'energy_refill', 'double_10m'
-        reward_amount BIGINT DEFAULT 0,  -- for 'points'; optional for others
-        status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'completed'
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        completed_at TIMESTAMPTZ
-      );
-    `);
-
-    // ---------- One-time backend tasks (e.g. Instagram follow) ----------
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS user_tasks (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        task_name TEXT NOT NULL,
-        reward BIGINT DEFAULT 0,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE (user_id, task_name)
-      );
-    `);
-
-    // Indexes
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_balance
       ON users (balance DESC);
@@ -253,18 +147,6 @@ async function getOrCreateUserFromInitData(req) {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_today
       ON users (today_farmed DESC);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_user_missions_user
-      ON user_missions (user_id);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_ad_sessions_user
-      ON ad_sessions (user_id);
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_user_tasks_user
-      ON user_tasks (user_id);
     `);
 
     // Upsert user
@@ -291,10 +173,9 @@ async function getOrCreateUserFromInitData(req) {
           taps_today,
           referrals_count,
           referrals_points,
-          double_boost_until,
-          streak_days
+          double_boost_until
         )
-        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0, NULL, 0)
+        VALUES ($1, $2, $3, $4, $5, 0, 50, 0, NULL, NULL, 0, 0, 0, NULL)
         RETURNING *;
       `,
         [telegramUserId, username, firstName, lastName, languageCode]
@@ -329,9 +210,9 @@ async function applyEnergyRegen(user) {
   while (diffSeconds > 0 && energy < maxEnergy) {
     let step;
 
-    if (energy < 10) step = 1; // fast regen
+    if (energy < 10) step = 1;      // fast regen
     else if (energy < 30) step = 3; // medium regen
-    else step = 6; // slow regen
+    else step = 6;                  // slow regen
 
     if (diffSeconds >= step) {
       energy += 1;
@@ -396,6 +277,7 @@ async function ensureDailyReset(user) {
 
 // ------------ Legacy tap helper (kept for compatibility) ------------
 async function handleTap(user) {
+  const maxEnergy = 50;
   if (user.energy <= 0) return user;
 
   if (todayDate() !== user.last_reset) {
@@ -406,7 +288,10 @@ async function handleTap(user) {
 
   let perTap = 1;
 
-  if (user.double_boost_until && new Date(user.double_boost_until) > new Date()) {
+  if (
+    user.double_boost_until &&
+    new Date(user.double_boost_until) > new Date()
+  ) {
     perTap = 2;
   }
 
@@ -476,7 +361,6 @@ async function buildClientState(user) {
     ok: true,
     balance: Number(user.balance || 0),
     energy: Number(user.energy || 0),
-    max_energy: Number(user.max_energy || 50),
     today: Number(user.today_farmed || 0),
     invite_link: inviteLink,
     referrals_count: Number(user.referrals_count || 0),
@@ -485,72 +369,10 @@ async function buildClientState(user) {
     global_total: total,
     double_boost_active: doubleBoostActive,
     double_boost_until: doubleBoostUntil,
-    streak_days: Number(user.streak_days || 0),
   };
 }
-
-// ------------ NEW: generic reward helpers ------------
-async function applyGenericReward(user, rewardType, rewardAmount) {
-  const type = rewardType || "points";
-  const amount = Number(rewardAmount || 0);
-  let updatedUser = user;
-
-  if (type === "points" && amount > 0) {
-    const res = await pool.query(
-      `
-      UPDATE users
-      SET balance = balance + $1
-      WHERE id = $2
-      RETURNING *;
-      `,
-      [amount, user.id]
-    );
-    updatedUser = res.rows[0];
-  } else if (type === "energy_refill") {
-    const res = await pool.query(
-      `
-      UPDATE users
-      SET energy = max_energy,
-          last_energy_ts = NOW()
-      WHERE id = $1
-      RETURNING *;
-      `,
-      [user.id]
-    );
-    updatedUser = res.rows[0];
-  } else if (type === "double_10m") {
-    const now = new Date();
-    const current =
-      user.double_boost_until && !isNaN(new Date(user.double_boost_until))
-        ? new Date(user.double_boost_until)
-        : now;
-    const base = current > now ? current : now;
-    const minutes = amount > 0 ? amount : 10;
-    const newUntil = new Date(base.getTime() + minutes * 60 * 1000);
-
-    const res = await pool.query(
-      `
-      UPDATE users
-      SET double_boost_until = $1
-      WHERE id = $2
-      RETURNING *;
-      `,
-      [newUntil.toISOString(), user.id]
-    );
-    updatedUser = res.rows[0];
-  } else {
-    // Unknown reward type – no-op for safety
-    console.warn("Unknown reward type:", type);
-  }
-
-  return updatedUser;
-}
-
-async function applyMissionReward(user, mission) {
-  return applyGenericReward(user, mission.payout_type, mission.payout_amount);
-}
-
 // ------------ Express Routes ------------
+
 // Health check
 app.get("/", (req, res) => {
   res.send("Airdrop Empire backend is running.");
@@ -571,11 +393,6 @@ app.post("/api/state", async (req, res) => {
     res.json(state);
   } catch (err) {
     console.error("Error /api/state:", err);
-
-    // ✅ IMPORTANT: do NOT 500 on missing Telegram ID (this was breaking everything)
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
     res.status(500).json({ ok: false, error: "STATE_ERROR" });
   }
 });
@@ -680,11 +497,6 @@ app.post("/api/tap", async (req, res) => {
     return res.json({ ...state, ok: true });
   } catch (err) {
     console.error("Error /api/tap:", err);
-
-    // ✅ IMPORTANT: do NOT 500 on missing Telegram ID
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
@@ -698,7 +510,7 @@ app.post("/api/boost/energy", async (req, res) => {
     user = await applyEnergyRegen(user);
     user = await ensureDailyReset(user);
 
-    const method = req.body && req.body.method === "points" ? "points" : "action";
+    const method = req.body.method === "points" ? "points" : "action";
 
     const maxEnergy = Number(user.max_energy || 50);
     const currentEnergy = Number(user.energy || 0);
@@ -750,15 +562,13 @@ app.post("/api/boost/energy", async (req, res) => {
       ok: true,
       message:
         method === "points"
-          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString("en-GB")} pts spent.`
+          ? `⚡ Energy refilled – ${ENERGY_REFILL_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
           : "⚡ Free energy boost activated.",
     });
   } catch (err) {
     console.error("Error /api/boost/energy:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
     res.status(500).json({ ok: false, error: "BOOST_ENERGY_ERROR" });
   }
 });
@@ -772,7 +582,7 @@ app.post("/api/boost/double", async (req, res) => {
     user = await applyEnergyRegen(user);
     user = await ensureDailyReset(user);
 
-    const method = req.body && req.body.method === "points" ? "points" : "action";
+    const method = req.body.method === "points" ? "points" : "action";
 
     let updatedUser;
 
@@ -817,452 +627,50 @@ app.post("/api/boost/double", async (req, res) => {
       ok: true,
       message:
         method === "points"
-          ? `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString("en-GB")} pts spent.`
+          ? `✨ Double points active – ${DOUBLE_BOOST_COST.toLocaleString(
+              "en-GB"
+            )} pts spent.`
           : "✨ Free double points boost activated!",
     });
   } catch (err) {
     console.error("Error /api/boost/double:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
     res.status(500).json({ ok: false, error: "BOOST_DOUBLE_ERROR" });
   }
 });
 
-// ------------ Missions API ------------
-
-// List active missions + user status
-app.post("/api/mission/list", async (req, res) => {
-  try {
-    const user = await getOrCreateUserFromInitData(req);
-    const kind = (req.body && req.body.kind) || null;
-
-    const params = [];
-    let where = "WHERE is_active = TRUE";
-    if (kind) {
-      params.push(kind);
-      where += ` AND kind = $${params.length}`;
-    }
-
-    const missionsRes = await pool.query(
-      `
-      SELECT id, code, title, description, payout_type, payout_amount, url, kind
-      FROM missions
-      ${where}
-      ORDER BY id ASC;
-      `,
-      params
-    );
-
-    const missionIds = missionsRes.rows.map((m) => m.id);
-    let userMissionMap = {};
-    if (missionIds.length > 0) {
-      const umRes = await pool.query(
-        `
-        SELECT mission_id, status, reward_applied
-        FROM user_missions
-        WHERE user_id = $1 AND mission_id = ANY($2::int[]);
-        `,
-        [user.id, missionIds]
-      );
-      userMissionMap = umRes.rows.reduce((acc, r) => {
-        acc[r.mission_id] = {
-          status: r.status,
-          reward_applied: r.reward_applied,
-        };
-        return acc;
-      }, {});
-    }
-
-    const missions = missionsRes.rows.map((m) => {
-      const um = userMissionMap[m.id];
-      return {
-        code: m.code,
-        title: m.title,
-        description: m.description,
-        payout_type: m.payout_type,
-        payout_amount: Number(m.payout_amount || 0),
-        url: m.url,
-        kind: m.kind,
-        status: um ? um.status : "not_started",
-        reward_applied: um ? um.reward_applied : false,
-      };
-    });
-
-    res.json({
-      ok: true,
-      missions,
-    });
-  } catch (err) {
-    console.error("Error /api/mission/list:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
-    res.status(500).json({ ok: false, error: "MISSION_LIST_ERROR" });
-  }
-});
-
-// Start a mission (returns redirect URL)
-app.post("/api/mission/start", async (req, res) => {
-  try {
-    const user = await getOrCreateUserFromInitData(req);
-    const code = ((req.body && req.body.code) || "").trim();
-
-    if (!code) {
-      return res.status(400).json({ ok: false, error: "MISSING_MISSION_CODE" });
-    }
-
-    const missionRes = await pool.query(
-      `
-      SELECT *
-      FROM missions
-      WHERE code = $1 AND is_active = TRUE
-      LIMIT 1;
-      `,
-      [code]
-    );
-
-    if (missionRes.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "MISSION_NOT_FOUND_OR_INACTIVE" });
-    }
-
-    const mission = missionRes.rows[0];
-
-    await pool.query(
-      `
-      INSERT INTO user_missions (user_id, mission_id, status, started_at)
-      VALUES ($1, $2, 'started', NOW())
-      ON CONFLICT (user_id, mission_id)
-      DO UPDATE SET
-        status = 'started',
-        started_at = COALESCE(user_missions.started_at, NOW());
-      `,
-      [user.id, mission.id]
-    );
-
-    res.json({
-      ok: true,
-      code: mission.code,
-      redirect_url: mission.url,
-    });
-  } catch (err) {
-    console.error("Error /api/mission/start:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
-    res.status(500).json({ ok: false, error: "MISSION_START_ERROR" });
-  }
-});
-
-// Complete a mission (MVP: trust client)
-app.post("/api/mission/complete", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
-    const code = ((req.body && req.body.code) || "").trim();
-
-    if (!code) {
-      return res.status(400).json({ ok: false, error: "MISSING_MISSION_CODE" });
-    }
-
-    const missionRes = await pool.query(
-      `
-      SELECT *
-      FROM missions
-      WHERE code = $1
-      LIMIT 1;
-      `,
-      [code]
-    );
-
-    if (missionRes.rowCount === 0) {
-      return res.status(404).json({ ok: false, error: "MISSION_NOT_FOUND" });
-    }
-
-    const mission = missionRes.rows[0];
-
-    const umRes = await pool.query(
-      `
-      INSERT INTO user_missions (user_id, mission_id, status, started_at, completed_at)
-      VALUES ($1, $2, 'completed', NOW(), NOW())
-      ON CONFLICT (user_id, mission_id)
-      DO UPDATE SET
-        status = 'completed',
-        completed_at = COALESCE(user_missions.completed_at, NOW())
-      RETURNING *;
-      `,
-      [user.id, mission.id]
-    );
-
-    const userMission = umRes.rows[0];
-
-    if (!userMission.reward_applied) {
-      user = await applyMissionReward(user, mission);
-
-      await pool.query(
-        `
-        UPDATE user_missions
-        SET reward_applied = TRUE,
-            verified_at = NOW()
-        WHERE id = $1;
-        `,
-        [userMission.id]
-      );
-    }
-
-    const state = await buildClientState(user);
-    res.json({
-      ...state,
-      ok: true,
-      mission: {
-        code: mission.code,
-        status: "completed",
-        reward_applied: true,
-      },
-    });
-  } catch (err) {
-    console.error("Error /api/mission/complete:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
-    res.status(500).json({ ok: false, error: "MISSION_COMPLETE_ERROR" });
-  }
-});
-
-// ------------ Rewarded Ad helper endpoints ------------
-// ------------ Rewarded Ad helper endpoints ------------
-
-// Create an ad session (front-end calls before showing video/ad)
-app.post("/api/boost/requestAd", async (req, res) => {
-  try {
-    const user = await getOrCreateUserFromInitData(req);
-
-    const rewardType = (req.body && req.body.reward_type) || "energy_refill"; // 'points', 'energy_refill', 'double_10m'
-    const rewardAmount = Number((req.body && req.body.reward_amount) || 0);
-    const network = (req.body && req.body.network) || null;
-
-    const validTypes = ["points", "energy_refill", "double_10m"];
-    if (!validTypes.includes(rewardType)) {
-      return res.status(400).json({ ok: false, error: "BAD_REWARD_TYPE" });
-    }
-
-    const adRes = await pool.query(
-      `
-      INSERT INTO ad_sessions (user_id, network, reward_type, reward_amount, status)
-      VALUES ($1, $2, $3, $4, 'pending')
-      RETURNING id, reward_type, reward_amount;
-      `,
-      [user.id, network, rewardType, rewardAmount]
-    );
-
-    const session = adRes.rows[0];
-
-    res.json({
-      ok: true,
-      ad_session_id: session.id,
-      reward_type: session.reward_type,
-      reward_amount: Number(session.reward_amount || 0),
-    });
-  } catch (err) {
-    console.error("Error /api/boost/requestAd:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
-    res.status(500).json({ ok: false, error: "REQUEST_AD_ERROR" });
-  }
-});
-
-// Mark ad session as completed & apply reward
-app.post("/api/boost/completeAd", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
-    const sessionId = Number((req.body && req.body.ad_session_id) || 0);
-
-    if (!sessionId) {
-      return res.status(400).json({ ok: false, error: "MISSING_SESSION_ID" });
-    }
-
-    const adRes = await pool.query(
-      `
-      SELECT *
-      FROM ad_sessions
-      WHERE id = $1 AND user_id = $2 AND status = 'pending'
-      LIMIT 1;
-      `,
-      [sessionId, user.id]
-    );
-
-    if (adRes.rowCount === 0) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "AD_SESSION_NOT_FOUND_OR_USED" });
-    }
-
-    const ad = adRes.rows[0];
-
-    // Apply reward via same generic engine as missions
-    user = await applyGenericReward(user, ad.reward_type, ad.reward_amount);
-
-    await pool.query(
-      `
-      UPDATE ad_sessions
-      SET status = 'completed',
-          completed_at = NOW()
-      WHERE id = $1;
-      `,
-      [ad.id]
-    );
-
-    const state = await buildClientState(user);
-
-    res.json({
-      ...state,
-      ok: true,
-      message: "🎁 Ad reward applied.",
-    });
-  } catch (err) {
-    console.error("Error /api/boost/completeAd:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
-    res.status(500).json({ ok: false, error: "COMPLETE_AD_ERROR" });
-  }
-});
-
-// ------------ Tasks route (daily + one-time tasks like Instagram) ------------
+// Daily task route (simple daily + backend sync)
 app.post("/api/task", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
-    const taskName = ((req.body && req.body.taskName) || "").trim();
+    const taskName = req.body.taskName;
 
     if (!taskName) {
       return res.status(400).json({ ok: false, error: "MISSING_TASK_NAME" });
     }
 
-    const reward = Number((req.body && req.body.reward) || 1000);
     const today = todayDate();
 
-    if (taskName === "daily") {
-      // Normalise last_daily into YYYY-MM-DD string
-      let lastDailyStr = null;
-      try {
-        if (user.last_daily) {
-          if (typeof user.last_daily === "string") {
-            lastDailyStr = user.last_daily.slice(0, 10);
-          } else {
-            const tmp = new Date(user.last_daily);
-            if (!isNaN(tmp)) lastDailyStr = tmp.toISOString().slice(0, 10);
-          }
-        }
-      } catch (e) {
-        console.error("Bad last_daily:", user.last_daily, e);
-        lastDailyStr = null;
-      }
-
-      // Only pay once per calendar day
-      if (lastDailyStr === today) {
-        const state = await buildClientState(user);
-        return res.json({
-          ...state,
-          ok: false,
-          reason: "DAILY_ALREADY_CLAIMED",
-        });
-      }
-
+    if (user.last_daily !== today) {
+      const reward = Number(req.body.reward || 1000);
       const newBalance = Number(user.balance || 0) + reward;
-
-      // Streak logic
-      let newStreak = Number(user.streak_days || 0) || 0;
-      if (lastDailyStr === yesterdayDate()) {
-        newStreak += 1;
-      } else {
-        newStreak = 1; // reset / start new streak
-      }
 
       const upd = await pool.query(
         `
         UPDATE users
         SET balance = $1,
-            last_daily = $2,
-            streak_days = $3
-        WHERE id = $4
+            last_daily = $2
+        WHERE id = $3
         RETURNING *;
-        `,
-        [newBalance, today, newStreak, user.id]
+      `,
+        [newBalance, today, user.id]
       );
       user = upd.rows[0];
-
-      const state = await buildClientState(user);
-      return res.json({
-        ...state,
-        ok: true,
-        reason: "DAILY_OK",
-      });
-    } else {
-      // One-time named tasks (e.g. instagram_follow, future socials, etc.)
-      // Prevent infinite spam via user_tasks unique constraint
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-
-        const ins = await client.query(
-          `
-          INSERT INTO user_tasks (user_id, task_name, reward)
-          VALUES ($1, $2, $3)
-          ON CONFLICT (user_id, task_name)
-          DO NOTHING
-          RETURNING id;
-          `,
-          [user.id, taskName, reward]
-        );
-
-        if (ins.rowCount === 0) {
-          await client.query("COMMIT");
-          const state = await buildClientState(user);
-          return res.json({
-            ...state,
-            ok: false,
-            reason: "TASK_ALREADY_COMPLETED",
-          });
-        }
-
-        const upd = await client.query(
-          `
-          UPDATE users
-          SET balance = balance + $1
-          WHERE id = $2
-          RETURNING *;
-          `,
-          [reward, user.id]
-        );
-        user = upd.rows[0];
-
-        await client.query("COMMIT");
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
-      }
-
-      const state = await buildClientState(user);
-      return res.json({
-        ...state,
-        ok: true,
-        reason: "TASK_COMPLETED_ONCE",
-      });
     }
+
+    const state = await buildClientState(user);
+    res.json(state);
   } catch (err) {
     console.error("Error /api/task:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
 });
@@ -1275,10 +683,6 @@ app.post("/api/friends", async (req, res) => {
     res.json(state);
   } catch (err) {
     console.error("Error /api/friends:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
     res.status(500).json({ ok: false, error: "FRIENDS_ERROR" });
   }
 });
@@ -1294,26 +698,24 @@ app.post("/api/withdraw/info", async (req, res) => {
     });
   } catch (err) {
     console.error("Error /api/withdraw/info:", err);
-
-    const handled = sendAuthError(res, err);
-    if (handled) return;
-
     res.status(500).json({ ok: false, error: "WITHDRAW_INFO_ERROR" });
   }
 });
 
-// ------------ Global leaderboard ------------
+// ------------ NEW: Global leaderboard ------------
 app.post("/api/leaderboard/global", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      // ✅ don't crash leaderboard if opened outside Telegram
-      console.warn("Auth missing in GLOBAL leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in GLOBAL leaderboard:",
+        e.message || e
+      );
     }
 
-    const limit = Math.max(1, Math.min(200, Number((req.body && req.body.limit) || 100)));
+    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
 
     const lbRes = await pool.query(
       `
@@ -1326,7 +728,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
       FROM users
       ORDER BY balance DESC, telegram_id ASC
       LIMIT $1;
-      `,
+    `,
       [limit]
     );
 
@@ -1361,17 +763,20 @@ app.post("/api/leaderboard/global", async (req, res) => {
   }
 });
 
-// ------------ Daily leaderboard (today_farmed) ------------
+// ------------ NEW: Daily leaderboard (today_farmed) ------------
 app.post("/api/leaderboard/daily", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.warn("Auth missing in DAILY leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in DAILY leaderboard:",
+        e.message || e
+      );
     }
 
-    const limit = Math.max(1, Math.min(200, Number((req.body && req.body.limit) || 100)));
+    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
 
     const lbRes = await pool.query(
       `
@@ -1384,7 +789,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
       FROM users
       ORDER BY today_farmed DESC, telegram_id ASC
       LIMIT $1;
-      `,
+    `,
       [limit]
     );
 
@@ -1425,7 +830,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
         myTid !== null
           ? {
               telegram_id: myTid,
-              today_farmed: Number((user && user.today_farmed) || 0),
+              today_farmed: Number(user.today_farmed || 0),
               daily_rank: myRank,
               daily_total: total,
             }
@@ -1437,15 +842,17 @@ app.post("/api/leaderboard/daily", async (req, res) => {
     res.status(500).json({ ok: false, error: "LEADERBOARD_DAILY_ERROR" });
   }
 });
-
-// ------------ Friends leaderboard ------------
+// ------------ NEW: Friends leaderboard ------------
 app.post("/api/leaderboard/friends", async (req, res) => {
   try {
     let user = null;
     try {
       user = await getOrCreateUserFromInitData(req);
     } catch (e) {
-      console.warn("Auth missing in FRIENDS leaderboard:", e.message || e);
+      console.error(
+        "getOrCreateUserFromInitData failed in FRIENDS leaderboard:",
+        e.message || e
+      );
     }
 
     if (!user || !user.telegram_id) {
@@ -1468,7 +875,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
         END AS friend_id
       FROM referrals
       WHERE inviter_id = $1 OR invited_id = $1;
-      `,
+    `,
       [myTid]
     );
 
@@ -1483,7 +890,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
       SELECT telegram_id, username, first_name, last_name, balance
       FROM users
       WHERE telegram_id = ANY($1::bigint[]);
-      `,
+    `,
       [idsForQuery]
     );
 
@@ -1548,7 +955,7 @@ bot.start(async (ctx) => {
         FROM users
         WHERE telegram_id = $1
         LIMIT 1;
-        `,
+      `,
         [telegramId]
       );
 
@@ -1565,7 +972,7 @@ bot.start(async (ctx) => {
           )
           VALUES ($1, $2, $3, $4, $5)
           RETURNING *;
-          `,
+        `,
           [telegramId, username, firstName, lastName, languageCode]
         );
         user = insertRes.rows[0];
@@ -1576,7 +983,9 @@ bot.start(async (ctx) => {
       const startPayload = ctx.startPayload;
       if (startPayload) {
         let payload = startPayload;
-        if (payload.startsWith("ref_")) payload = payload.slice(4);
+        if (payload.startsWith("ref_")) {
+          payload = payload.slice(4);
+        }
         const inviterId = Number(payload);
 
         if (inviterId && inviterId !== telegramId) {
@@ -1585,7 +994,7 @@ bot.start(async (ctx) => {
             SELECT *
             FROM referrals
             WHERE inviter_id = $1 AND invited_id = $2;
-            `,
+          `,
             [inviterId, telegramId]
           );
 
@@ -1594,7 +1003,7 @@ bot.start(async (ctx) => {
               `
               INSERT INTO referrals (inviter_id, invited_id)
               VALUES ($1, $2);
-              `,
+            `,
               [inviterId, telegramId]
             );
 
@@ -1605,7 +1014,7 @@ bot.start(async (ctx) => {
                   referrals_count = referrals_count + 1,
                   referrals_points = referrals_points + $1
               WHERE telegram_id = $2;
-              `,
+            `,
               [REFERRAL_REWARD, inviterId]
             );
           }
@@ -1620,20 +1029,23 @@ bot.start(async (ctx) => {
       client.release();
     }
 
-    await ctx.reply("🔥 Welcome to Airdrop Empire!\n\nTap below to open the game 👇", {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "🚀 Open Airdrop Empire",
-              web_app: {
-                url: "https://resilient-kheer-041b8c.netlify.app",
+    await ctx.reply(
+      "🔥 Welcome to Airdrop Empire!\n\nTap below to open the game 👇",
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🚀 Open Airdrop Empire",
+                web_app: {
+                  url: "https://resilient-kheer-041b8c.netlify.app",
+                },
               },
-            },
+            ],
           ],
-        ],
-      },
-    });
+        },
+      }
+    );
   } catch (err) {
     console.error("Error in /start handler:", err);
     await ctx.reply("Something went wrong. Please try again later.");
@@ -1642,7 +1054,9 @@ bot.start(async (ctx) => {
 
 // Simple commands for debugging
 bot.command("tasks", async (ctx) => {
-  await ctx.reply("✨ Daily tasks coming soon.\nWe will add partner quests, socials & more.");
+  await ctx.reply(
+    "✨ Daily tasks coming soon.\nWe will add partner quests, socials & more."
+  );
 });
 
 bot.command("tap", async (ctx) => {
@@ -1654,7 +1068,9 @@ bot.command("tap", async (ctx) => {
           [
             {
               text: "🚀 Open Airdrop Empire",
-              web_app: { url: "https://resilient-kheer-041b8c.netlify.app" },
+              web_app: {
+                url: "https://resilient-kheer-041b8c.netlify.app",
+              },
             },
           ],
         ],
@@ -1679,6 +1095,8 @@ async function start() {
     console.log(`🌐 Express API running on port ${PORT}`);
   });
 
+  // In Render you can get 409 if another instance or a local dev bot is polling.
+  // We catch that so Express keeps running.
   try {
     await bot.launch();
     console.log("🤖 Telegram bot launched as @%s", BOT_USERNAME);
