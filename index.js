@@ -89,7 +89,8 @@ async function ensureSchema(client) {
       taps_today INT DEFAULT 0,
       referrals_count BIGINT DEFAULT 0,
       referrals_points BIGINT DEFAULT 0,
-      double_boost_until TIMESTAMPTZ
+      double_boost_until TIMESTAMPTZ,
+      instagram_claimed_at TIMESTAMPTZ
     );
 
     CREATE UNIQUE INDEX IF NOT EXISTS users_telegram_id_unique
@@ -112,7 +113,8 @@ async function ensureSchema(client) {
       ADD COLUMN IF NOT EXISTS taps_today INT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS referrals_count BIGINT DEFAULT 0,
       ADD COLUMN IF NOT EXISTS referrals_points BIGINT DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ,
+      instagram_claimed_at TIMESTAMPTZ;
   `);
 // Referrals (telegram_id based)
   await client.query(`
@@ -1100,11 +1102,45 @@ app.post("/api/task", async (req, res) => {
     }
 
     
-    // Daily claim (fixed +500, 24h cooldown)
+    // Task handlers
+    // 1) Daily claim (fixed +500, 24h cooldown)
+    // 2) Instagram follow (one-time +1,000)
+
+    if (taskName === "instagram_follow") {
+      // One-time reward (we can’t truly verify a follow; we treat the click as completion)
+      const IG_REWARD = 1000;
+
+      if (user.instagram_claimed_at) {
+        const state = await buildClientState(user);
+        return res.json({ ...state, ok: false, reason: "ALREADY_CLAIMED" });
+      }
+
+      const upd = await pool.query(
+        `
+        UPDATE public.users
+        SET balance = balance + $1,
+            instagram_claimed_at = NOW()
+        WHERE id = $2 AND instagram_claimed_at IS NULL
+        RETURNING *;
+        `,
+        [IG_REWARD, user.id]
+      );
+
+      if (upd.rowCount === 0) {
+        const state = await buildClientState(user);
+        return res.json({ ...state, ok: false, reason: "ALREADY_CLAIMED" });
+      }
+
+      user = upd.rows[0];
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: true });
+    }
+
     if (taskName !== "daily") {
       const state = await buildClientState(user);
       return res.json({ ...state, ok: false, reason: "UNKNOWN_TASK" });
     }
+
 
     const now = new Date();
     const last = user.last_daily_ts ? new Date(user.last_daily_ts) : null;
