@@ -12,6 +12,10 @@ const { Pool } = require("pg");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_USERNAME = process.env.BOT_USERNAME || "AirdropEmpireAppBot";
+const WEB_APP_URL = process.env.WEB_APP_URL || "https://resilient-kheer-041b8c.netlify.app";
+const ALLOW_DEV_FALLBACK = process.env.ALLOW_DEV_FALLBACK === "1";
+const MIN_TAP_INTERVAL_MS = parseInt(process.env.MIN_TAP_INTERVAL_MS || "200", 10);
+
 
 // Render / scaling safe: set DISABLE_BOT_POLLING=1 to stop 409 conflicts
 const DISABLE_BOT_POLLING = String(process.env.DISABLE_BOT_POLLING || "").trim() === "1";
@@ -36,13 +40,6 @@ function todayDate() {
   return new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
-// Seconds until next UTC day (for countdown)
-function secondsUntilNextUtcMidnight() {
-  const now = new Date();
-  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
-  return Math.max(0, Math.floor((next - now) / 1000));
-}
-
 // Referral reward per new friend (once, when they join)
 const REFERRAL_REWARD = 800;
 
@@ -52,9 +49,6 @@ const ENERGY_REFILL_COST = 500;
 // Cost (in points) for paid double-points boost (10 mins)
 const DOUBLE_BOOST_COST = 1000;
 
-// Daily check-in reward (fixed)
-const DAILY_CHECKIN_REWARD = 500;
-
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
@@ -63,7 +57,7 @@ app.use(cors());
 app.use(express.json());
 
 // ------------ Mini-app auth helper ------------
-function parseInitData(initDataRaw) {
+function parseInitDataRaw(initDataRaw) {
   if (!initDataRaw) return {};
   const params = new URLSearchParams(initDataRaw);
   const data = {};
@@ -75,33 +69,74 @@ function parseInitData(initDataRaw) {
 
 // ------------ Ensure Supabase schema exists (SAFE) ------------
 async function ensureSchema(client) {
-  // Ensure users has the columns our backend needs (keeps your existing Supabase columns too)
+  // Bulletproof: create minimal tables/columns if missing, without assuming a fresh DB.
+  // Runs on every request but queries are idempotent.
+
+  // 1) users table (create if missing)
   await client.query(`
-    ALTER TABLE public.users
-    ADD COLUMN IF NOT EXISTS telegram_id BIGINT;
-
-    CREATE UNIQUE INDEX IF NOT EXISTS users_telegram_id_unique
-    ON public.users (telegram_id);
-
-    ALTER TABLE public.users
-    ADD COLUMN IF NOT EXISTS username TEXT,
-    ADD COLUMN IF NOT EXISTS first_name TEXT,
-    ADD COLUMN IF NOT EXISTS last_name TEXT,
-    ADD COLUMN IF NOT EXISTS language_code TEXT,
-    ADD COLUMN IF NOT EXISTS balance BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS energy INT DEFAULT 50,
-    ADD COLUMN IF NOT EXISTS max_energy INT DEFAULT 50,
-    ADD COLUMN IF NOT EXISTS today_farmed BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS last_daily DATE,
-    ADD COLUMN IF NOT EXISTS last_reset DATE,
-    ADD COLUMN IF NOT EXISTS last_energy_ts TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS taps_today INT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS referrals_count BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS referrals_points BIGINT DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS double_boost_until TIMESTAMPTZ;
+    CREATE TABLE IF NOT EXISTS public.users (
+      id SERIAL PRIMARY KEY,
+      telegram_id BIGINT UNIQUE,
+      username TEXT,
+      first_name TEXT,
+      last_name TEXT,
+      language_code TEXT,
+      balance BIGINT DEFAULT 0,
+      energy INT DEFAULT 50,
+      max_energy INT DEFAULT 50,
+      today_farmed BIGINT DEFAULT 0,
+      last_daily DATE,
+      last_daily_ts TIMESTAMPTZ,
+      last_reset DATE,
+      last_energy_ts TIMESTAMPTZ,
+      taps_today INT DEFAULT 0,
+      referrals_count BIGINT DEFAULT 0,
+      referrals_points BIGINT DEFAULT 0,
+      double_boost_until TIMESTAMPTZ,
+      instagram_claimed_at TIMESTAMPTZ
+    );
   `);
 
-  // Referrals (telegram_id based)
+  // 2) add any missing columns (safe if table existed with a different schema)
+  const addCols = [
+    ["telegram_id", "BIGINT"],
+    ["username", "TEXT"],
+    ["first_name", "TEXT"],
+    ["last_name", "TEXT"],
+    ["language_code", "TEXT"],
+    ["balance", "BIGINT DEFAULT 0"],
+    ["energy", "INT DEFAULT 50"],
+    ["max_energy", "INT DEFAULT 50"],
+    ["today_farmed", "BIGINT DEFAULT 0"],
+    ["last_daily", "DATE"],
+    ["last_daily_ts", "TIMESTAMPTZ"],
+    ["last_reset", "DATE"],
+    ["last_energy_ts", "TIMESTAMPTZ"],
+    ["taps_today", "INT DEFAULT 0"],
+    ["referrals_count", "BIGINT DEFAULT 0"],
+    ["referrals_points", "BIGINT DEFAULT 0"],
+    ["double_boost_until", "TIMESTAMPTZ"],
+    ["instagram_claimed_at", "TIMESTAMPTZ"],
+  ];
+
+  for (const [col, def] of addCols) {
+    await client.query(`ALTER TABLE public.users ADD COLUMN IF NOT EXISTS ${col} ${def};`);
+  }
+
+  // Unique index (in case telegram_id existed but wasn't unique)
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname='public' AND indexname='users_telegram_id_unique'
+      ) THEN
+        CREATE UNIQUE INDEX users_telegram_id_unique ON public.users (telegram_id);
+      END IF;
+    END $$;
+  `);
+
+  // 3) referrals table
   await client.query(`
     CREATE TABLE IF NOT EXISTS public.referrals (
       id SERIAL PRIMARY KEY,
@@ -112,7 +147,7 @@ async function ensureSchema(client) {
     );
   `);
 
-  // Missions
+  // 4) missions tables
   await client.query(`
     CREATE TABLE IF NOT EXISTS public.missions (
       id SERIAL PRIMARY KEY,
@@ -128,7 +163,6 @@ async function ensureSchema(client) {
     );
   `);
 
-  // User missions (user_id references public.users.id)
   await client.query(`
     CREATE TABLE IF NOT EXISTS public.user_missions (
       id SERIAL PRIMARY KEY,
@@ -143,7 +177,7 @@ async function ensureSchema(client) {
     );
   `);
 
-  // Ad sessions
+  // 5) ad sessions table
   await client.query(`
     CREATE TABLE IF NOT EXISTS public.ad_sessions (
       id SERIAL PRIMARY KEY,
@@ -157,19 +191,18 @@ async function ensureSchema(client) {
     );
   `);
 
-  // Indexes
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_users_balance ON public.users (balance DESC);
-    CREATE INDEX IF NOT EXISTS idx_users_today ON public.users (today_farmed DESC);
-    CREATE INDEX IF NOT EXISTS idx_user_missions_user ON public.user_missions (user_id);
-    CREATE INDEX IF NOT EXISTS idx_ad_sessions_user ON public.ad_sessions (user_id);
-  `);
+  // 6) indexes for speed
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_users_balance ON public.users (balance DESC);`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_users_today ON public.users (today_farmed DESC);`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_user_missions_user ON public.user_missions (user_id);`);
+  await client.query(`CREATE INDEX IF NOT EXISTS idx_ad_sessions_user ON public.ad_sessions (user_id);`);
 }
 
+//
 // Get or create a user from Telegram initData / dev fallback
 async function getOrCreateUserFromInitData(req) {
   const initDataRaw = req.body.initData || req.query.initData || "";
-  const data = parseInitData(initDataRaw);
+  const data = parseInitDataRaw(initDataRaw);
 
   let telegramUserId = null;
   let username = null;
@@ -190,13 +223,10 @@ async function getOrCreateUserFromInitData(req) {
     }
   }
 
-  // DEV fallback: allow telegram_id in body or query
-  if (!telegramUserId) {
-    if (req.body.telegram_id) {
-      telegramUserId = Number(req.body.telegram_id);
-    } else if (req.query.telegram_id) {
-      telegramUserId = Number(req.query.telegram_id);
-    }
+  // DEV fallback: allow telegram_id in body or query ONLY if ALLOW_DEV_FALLBACK=1
+  if (!telegramUserId && ALLOW_DEV_FALLBACK) {
+    if (req.body.telegram_id) telegramUserId = Number(req.body.telegram_id);
+    else if (req.query.telegram_id) telegramUserId = Number(req.query.telegram_id);
   }
 
   if (!telegramUserId) {
@@ -280,7 +310,8 @@ async function applyEnergyRegen(user) {
     `
     UPDATE public.users
     SET energy = $1,
-        last_energy_ts = NOW()
+        last_energy_ts = NOW(),
+          last_tap_ts    = NOW()
     WHERE id = $2
     `,
     [energy, user.id]
@@ -446,7 +477,8 @@ async function applyGenericReward(user, rewardType, rewardAmount) {
       `
       UPDATE public.users
       SET energy = max_energy,
-          last_energy_ts = NOW()
+          last_energy_ts = NOW(),
+          last_tap_ts    = NOW()
       WHERE id = $1
       RETURNING *;
       `,
@@ -562,6 +594,14 @@ app.post("/api/tap", async (req, res) => {
     // 2) New day? reset today_farmed, taps_today, and refill to max
     user = await ensureDailyReset(user);
 
+    // 2.5) Tap throttle (anti-spam)
+    const lastTap = user.last_tap_ts ? new Date(user.last_tap_ts) : null;
+    const nowTs = new Date();
+    if (lastTap && !isNaN(lastTap) && (nowTs - lastTap) < MIN_TAP_INTERVAL_MS) {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "TAP_TOO_FAST" });
+    }
+
     // 3) If no energy, don't allow tap
     const currentEnergy = Number(user.energy || 0);
     if (currentEnergy <= 0) {
@@ -601,7 +641,8 @@ app.post("/api/tap", async (req, res) => {
           energy         = $2,
           today_farmed   = $3,
           taps_today     = $4,
-          last_energy_ts = NOW()
+          last_energy_ts = NOW(),
+          last_tap_ts    = NOW()
       WHERE id = $5
       RETURNING *;
       `,
@@ -616,7 +657,6 @@ app.post("/api/tap", async (req, res) => {
     res.status(500).json({ ok: false, error: "TAP_ERROR" });
   }
 });
-
 // Energy boost – refill energy via action or by spending points (hybrid)
 app.post("/api/boost/energy", async (req, res) => {
   try {
@@ -627,6 +667,16 @@ app.post("/api/boost/energy", async (req, res) => {
     user = await ensureDailyReset(user);
 
     const method = req.body.method === "points" ? "points" : "action";
+
+    if (method === "action") {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "USE_REWARDED_AD" });
+    }
+
+    if (method === "action") {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "USE_REWARDED_AD" });
+    }
 
     const maxEnergy = Number(user.max_energy || 50);
     const currentEnergy = Number(user.energy || 0);
@@ -655,7 +705,8 @@ app.post("/api/boost/energy", async (req, res) => {
         UPDATE public.users
         SET balance        = balance - $1,
             energy         = max_energy,
-            last_energy_ts = NOW()
+            last_energy_ts = NOW(),
+          last_tap_ts    = NOW()
         WHERE id = $2
         RETURNING *;
         `,
@@ -667,7 +718,8 @@ app.post("/api/boost/energy", async (req, res) => {
         `
         UPDATE public.users
         SET energy         = max_energy,
-            last_energy_ts = NOW()
+            last_energy_ts = NOW(),
+          last_tap_ts    = NOW()
         WHERE id = $1
         RETURNING *;
         `,
@@ -703,6 +755,16 @@ app.post("/api/boost/double", async (req, res) => {
     user = await ensureDailyReset(user);
 
     const method = req.body.method === "points" ? "points" : "action";
+
+    if (method === "action") {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "USE_REWARDED_AD" });
+    }
+
+    if (method === "action") {
+      const state = await buildClientState(user);
+      return res.json({ ...state, ok: false, reason: "USE_REWARDED_AD" });
+    }
 
     let updatedUser;
 
@@ -1047,85 +1109,90 @@ app.post("/api/boost/completeAd", async (req, res) => {
   }
 });
 
-// Daily task route – DAILY CHECK-IN (24h cooldown, fixed +500, explicit response)
-app.post("/api/task", async (req, res) => {
+// Daily task route (simple daily + backend sync, FIXED one-claim-per-24h)
+// NOTE: Frontend variations sometimes call different endpoints / task names.
+// We support aliases so "Daily Check-in" never falls back to a placeholder.
+async function handleTask(req, res) {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    const taskNameRaw = req.body.taskName || "";
-    const taskName = String(taskNameRaw).trim().toLowerCase();
+    const raw =
+      (req.body && (req.body.taskName || req.body.task || req.body.code || req.body.type)) ||
+      (req.query && (req.query.taskName || req.query.task || req.query.code || req.query.type)) ||
+      "";
 
-    // Accept a couple of likely frontend variants
+    const taskName = String(raw || "").trim().toLowerCase();
+
+    // Default to daily check-in if frontend forgot to send taskName
     const isDaily =
-      taskName === "daily_checkin" ||
-      taskName === "daily-checkin" ||
+      !taskName ||
       taskName === "daily" ||
       taskName === "daily_check_in" ||
-      taskName === "checkin" ||
-      taskName === "check_in";
+      taskName === "daily_checkin" ||
+      taskName === "dailycheckin";
 
-    if (!isDaily) {
-      return res.json({ ok: false, reason: "UNKNOWN_TASK" });
-    }
+    if (isDaily) {
+      const reward = 500;
+      const now = Date.now();
+      const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
-    const today = todayDate(); // "YYYY-MM-DD"
-
-    // Normalise last_daily (can be Date or null)
-    let lastDailyStr = null;
-    try {
-      if (user.last_daily) {
-        if (typeof user.last_daily === "string") {
-          lastDailyStr = user.last_daily.slice(0, 10);
-        } else {
-          const d = new Date(user.last_daily);
-          if (!isNaN(d)) lastDailyStr = d.toISOString().slice(0, 10);
-        }
+      let last = null;
+      if (user.last_daily_ts) {
+        const t = new Date(user.last_daily_ts).getTime();
+        if (!Number.isNaN(t)) last = t;
       }
-    } catch (e) {
-      console.error("Bad last_daily:", user.last_daily, e);
-      lastDailyStr = null;
-    }
 
-    // Already claimed today → return explicit cooldown
-    if (lastDailyStr === today) {
+      const nextAtMs = last ? last + COOLDOWN_MS : 0;
+      const canClaim = !last || now >= nextAtMs;
+
+      if (!canClaim) {
+        const state = await buildClientState(user);
+        return res.json({
+          ...state,
+          ok: false,
+          reason: "COOLDOWN",
+          next_at: new Date(nextAtMs).toISOString(),
+          cooldown_seconds: Math.max(1, Math.ceil((nextAtMs - now) / 1000)),
+        });
+      }
+
+      const upd = await pool.query(
+        `
+        UPDATE public.users
+        SET balance = balance + $1,
+            last_daily_ts = NOW(),
+            last_daily = CURRENT_DATE
+        WHERE id = $2
+        RETURNING *;
+        `,
+        [reward, user.id]
+      );
+
+      user = upd.rows[0];
       const state = await buildClientState(user);
+
       return res.json({
         ...state,
-        ok: false,
-        reason: "ALREADY_CLAIMED",
-        next_claim_in_seconds: secondsUntilNextUtcMidnight(),
+        ok: true,
+        claimed: true,
+        reward,
+        next_at: new Date(Date.now() + COOLDOWN_MS).toISOString(),
       });
     }
 
-    // Apply +500 and mark claimed for today (DATE column)
-    const newBalance = Number(user.balance || 0) + DAILY_CHECKIN_REWARD;
-
-    const upd = await pool.query(
-      `
-      UPDATE public.users
-      SET balance = $1,
-          last_daily = $2
-      WHERE id = $3
-      RETURNING *;
-      `,
-      [newBalance, today, user.id]
-    );
-
-    user = upd.rows[0];
+    // Unknown / future tasks
     const state = await buildClientState(user);
-
-    return res.json({
-      ...state,
-      ok: true,
-      reward: DAILY_CHECKIN_REWARD,
-      message: "🔥 Daily check-in claimed!",
-      next_claim_in_seconds: secondsUntilNextUtcMidnight(),
-    });
+    return res.json({ ...state, ok: false, reason: "TASK_NOT_SUPPORTED", task: taskName });
   } catch (err) {
     console.error("Error /api/task:", err);
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
-});
+}
+
+app.post("/api/task", handleTask);
+// Alias endpoints used by some frontends
+app.post("/api/daily-checkin", handleTask);
+app.post("/api/daily", handleTask);
 
 // Friends summary (kept for existing front-end)
 app.post("/api/friends", async (req, res) => {
@@ -1479,7 +1546,7 @@ bot.start(async (ctx) => {
               {
                 text: "🚀 Open Airdrop Empire",
                 web_app: {
-                  url: "https://resilient-kheer-041b8c.netlify.app",
+                  url: WEB_APP_URL,
                 },
               },
             ],
@@ -1510,7 +1577,7 @@ bot.command("tap", async (ctx) => {
             {
               text: "🚀 Open Airdrop Empire",
               web_app: {
-                url: "https://resilient-kheer-041b8c.netlify.app",
+                url: WEB_APP_URL,
               },
             },
           ],
@@ -1559,8 +1626,8 @@ async function start() {
     }
   }
 
-  process.once("SIGINT", () => bot.stop("SIGINT"));
-  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  process.once("SIGINT", () => { try { bot.stop("SIGINT"); } catch (e) { console.log("Bot stop skipped:", e.message); } });
+  process.once("SIGTERM", () => { try { bot.stop("SIGTERM"); } catch (e) { console.log("Bot stop skipped:", e.message); } });
 }
 
 start().catch((err) => {
