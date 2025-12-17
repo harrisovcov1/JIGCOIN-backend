@@ -1,1 +1,1 @@
-# airdrop-empire-bot
+# JIGCOIN-bot
