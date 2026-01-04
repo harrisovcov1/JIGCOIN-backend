@@ -75,7 +75,7 @@ const TAP_PACKET_MAX = Number(process.env.TAP_PACKET_MAX || 25);
 // Stripe (VIP Checkout + Webhook)
 const STRIPE_SECRET_KEY = String(process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
-// Used for Stripe success/cancel redirects (e.g. your Netlify URL)
+// Used for Stripe success/cancel redirects (e.g. your Cloudflare URL)
 const APP_BASE_URL = String(process.env.APP_BASE_URL || "").trim();
 
 // Coinbase Commerce (crypto)
@@ -5062,7 +5062,7 @@ bot.start(async (ctx) => {
               {
                 text: "🚀 Start Farming",
                 web_app: {
-                  url: "https://resilient-kheer-041b8c.netlify.app",
+                  url: "https://jigcoin-frontend.pages.dev",
                 },
               },
             ],
@@ -5093,7 +5093,7 @@ bot.command("tap", async (ctx) => {
             {
               text: "🚀 Open JigCoin",
               web_app: {
-                url: "https://resilient-kheer-041b8c.netlify.app",
+                url: "https://jigcoin-frontend.pages.dev",
               },
             },
           ],
