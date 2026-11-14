@@ -2441,27 +2441,24 @@ async function handleTap(user) {
 }
 // ------------ Global rank helper ------------
 async function getGlobalRankForUser(user) {
-  const balance = Number(user.balance || 0);
-
-  const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM public.users;`);
-  const total = Number(totalRes.rows[0].count);
-
-  if (total === 0) return { rank: null, total: 0 };
-
-  const aboveRes = await pool.query(
+  // Match both leaderboard endpoints exactly, including tied balances. One query
+  // keeps the position and player count in the same database snapshot.
+  const result = await pool.query(
     `
-    SELECT COUNT(*) AS count
-    FROM public.users
-    WHERE balance > $1;
+    SELECT ranked.position, ranked.total
+    FROM (
+      SELECT id,
+        ROW_NUMBER() OVER (ORDER BY balance DESC, telegram_id ASC) AS position,
+        COUNT(*) OVER () AS total
+      FROM public.users
+    ) AS ranked
+    WHERE ranked.id = $1;
     `,
-    [balance]
+    [user.id]
   );
-
-  const countAbove = Number(aboveRes.rows[0].count);
-  return {
-    rank: countAbove + 1,
-    total,
-  };
+  const row = result.rows[0];
+  return row ? { rank: Number(row.position), total: Number(row.total) }
+             : { rank: null, total: 0 };
 }
 
 // ------------ Build state for frontend ------------
