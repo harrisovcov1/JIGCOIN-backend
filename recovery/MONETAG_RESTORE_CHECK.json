@@ -1,0 +1,22 @@
+{
+  "scope": "All public-schema objects/data/ACLs from supplied backup, plus original auth.uid/auth.jwt dependencies; no managed Supabase services or extensions restored",
+  "checks": [
+    "Public schema restored with original ownership, ACLs, data, constraints, indexes, functions and triggers",
+    "V2 CRLF reproduced the reported exception; isolated failure was function-body checksum, with original function restored and no private schema committed",
+    "V3 rejected deliberately incorrect function hash, anonymous schema access and disabled RLS, naming each failed check and leaving no private schema or function change after rollback",
+    "V3 installer applied with LF then CRLF as original public-table owner; all seven checks passed for both and all existing public rows unchanged",
+    "All five restored active quests: pending gate, concurrent duplicate callbacks/claims, exact +200 once, persisted cooldown",
+    "Restored anon/authenticated roles denied private reward-table access"
+  ],
+  "tables_preserved": 60,
+  "rows_preserved": 3812,
+  "status": "PASS",
+  "backup_sha256": "63095ab96b8be04714e5d43a2c8687c948db6a247f686d73cd7b92e8dd4cc94c",
+  "production_changed": false,
+  "runtime_role_limit": "Checked as the restored postgres table-owner role; the production connection role remains to be confirmed.",
+  "local_test_database_discarded": true,
+  "checked_installer": "sql/install_monetag_rewards_checked_v3.sql",
+  "checked_installer_sha256": "2d662ce2283a3446bac55d61da687ec04ce75b2664769b93f84a5ee686856f47",
+  "checked_on": "2026-11-14",
+  "live_failure_cause": "Unconfirmed. V2 CRLF reproduces the generic live error locally; the live failing check was not reported."
+}

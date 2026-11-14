@@ -1,0 +1,19 @@
+{
+  "index.js": "7b859ea0255e5b0b767072555140f4540c6a61935c3dd66f689b84123c704989",
+  "lib/jobHandlers.js": "4c7e7c6d6922d4c2f98944aeadacd6141e7f68f4644b0ae6cfa0c06596166c90",
+  "lib/payoutProvider.js": "e301cf332f6c88a27029287a9e7486b257a0ee7f9956727f3d84187c88da6656",
+  "lib/monetagRewards.js": "86b42e400b995fea2c1dad45c737e54986a3f7d803917cda16e5beb30665afb1",
+  "package.json": "2078cad8d2f2d9b625a79e53d4d302d36a2c576af575164272c2184ec4a4bcb3",
+  "package-lock.json": "9097054da5136ea9695886520b425db0e4395a64b44c757aabf570eb3efb0792",
+  ".gitignore": "748a10cc7ecf212b8c93c35c8de01d70e8af03ffe380d8cf7b1acf6381ab32a1",
+  "RECOVERY.md": "0c9c22b53e0a1db89086b1fd9bc6558597becaf38795380fb047418d7f45e974",
+  "sql/migrations/006_monetag_rewards.sql": "6a23684c55c7d9dcbb6431699b7d0024f7799069331e549bbb6fc742e4278988",
+  "sql/install_monetag_rewards_checked.sql": "2d662ce2283a3446bac55d61da687ec04ce75b2664769b93f84a5ee686856f47",
+  "sql/install_monetag_rewards_checked_v3.sql": "2d662ce2283a3446bac55d61da687ec04ce75b2664769b93f84a5ee686856f47",
+  "test/recovery-safety.test.js": "3eda5996fd259319f971921e008c32edda649f7b646107c77c22a181e0caf6b7",
+  "test/monetag-postgres.test.js": "271165807c1d1802e1cedecf023a427a4ac92a17d3c137862cdcdd0ae6e28945",
+  "recovery/MONETAG_SETUP.md": "603a06a4ae532a98b1883290c89ffc817dc33e8d0bb1fb8a85b799ea854b6905",
+  "recovery/MONETAG_RESTORE_CHECK.json": "4518e3442ae4c319dddd77d2d7159cd4ac08ab93c4e4f82ed02a77825f65202a",
+  "recovery/DEPLOYMENT_PROGRESS.md": "fd6afffd6551f9287700b1550442e1c72de523b20d5462a57503250e72c89b1e",
+  "recovery/UPLOAD_README.md": "f99d902230a704ac53d2e0bf3934f94f77581f6bcc83c4242336f5361edcec8e"
+}

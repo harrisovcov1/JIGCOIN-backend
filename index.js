@@ -12,6 +12,7 @@ const { enqueueJob } = require("./lib/jobs");
 const { ensureIdempotencyKeyTx, completeIdempotencyKeyTx } = require("./lib/idempotency");
 const powerups = require("./lib/powerups");
 const { loadConfig } = require("./lib/config");
+const { createMonetagRewards } = require("./lib/monetagRewards");
 const crypto = require("crypto");
 const Stripe = require("stripe");
 const fetch = require("node-fetch");
@@ -133,7 +134,6 @@ function resolveMissionUrl(rawUrl) {
 
 function cooldownMsFromHours(h) {
   const n = Number(h);
-  if (n === 24) return 10 * 60 * 1000;
   return n * 60 * 60 * 1000;
 }
 
@@ -543,6 +543,7 @@ async function fulfillStreakRestoreByTelegramId({ telegramId, sku, provider, pro
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
+const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env });
 
 app.use(cors());
 // Capture raw body for Stripe webhook signature verification (without breaking JSON parsing)
@@ -556,6 +557,10 @@ app.use(
 
 // Support x-www-form-urlencoded (many ad networks post back this way)
 app.use(express.urlencoded({ extended: false }));
+
+// Authenticated provider receipts must survive app maintenance/rate limits.
+// This route only persists confirmation; it never grants a reward.
+app.get("/postback/monetag", monetagRewards.handler(req => monetagRewards.postback(req.query)));
 
 // ------------ Public stats (for Early Access announcements) ------------
 // Used by the frontend to show a blocking welcome announcement until the first 1,000 users.
@@ -607,6 +612,7 @@ app.use(async (req, res, next) => {
     }
   } catch (e) {}
   next();
+});
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -628,8 +634,34 @@ app.use((req, res, next) => {
     error: "MAINTENANCE_MODE",
   });
 });
-});
 
+
+// Verified rewarded quests supersede the legacy timer-only handlers below.
+for (const action of ["start", "complete"]) {
+  app.post(`/api/mission/${action}`, (req, res, next) => {
+    const code = typeof req.body?.code === "string" ? req.body.code.trim() : "";
+    if (!monetagRewards.manages(code)) {
+      if (code.startsWith("sp_")) return res.status(503).json({ ok: false, error: "AD_REWARDS_UNAVAILABLE" });
+      return next();
+    }
+    return monetagRewards.handler(async () => {
+      const user = await getOrCreateUserFromInitData(req);
+      if (action === "start") return monetagRewards.start(user, code);
+      return monetagRewards.claim(user, code, req.body.attempt_id);
+    })(req, res);
+  });
+}
+// Old ad helpers accept client-chosen rewards or unverified "action" claims.
+// Keep them closed until boosts use the same verified lifecycle.
+for (const path of ["/api/boost/requestAd", "/api/boost/completeAd"]) {
+  app.post(path, (_req, res) => res.status(503).json({ ok: false, error: "AD_REWARDS_UNAVAILABLE" }));
+}
+for (const path of ["/api/boost/double", "/api/boost/energy"]) {
+  app.post(path, (req, res, next) => {
+    if (req.body?.method !== "points") return res.status(503).json({ ok: false, reason: "AD_REWARDS_UNAVAILABLE" });
+    return next();
+  });
+}
 
 // ------------ App config (feature flags, tuning) ------------
 // Frontend uses this to read app_settings so we can tune behaviour without redeploying.
@@ -2747,6 +2779,9 @@ async function handleOgadsPostback(req, res) {
     const payout = q.payout != null ? Number(q.payout) : null;
     const secret = String(q.secret || q.token || q.key || "").trim();
 
+    if (!OGADS_POSTBACK_SECRET || monetagRewards.manages(missionCode)) {
+      return res.status(403).send("FORBIDDEN");
+    }
     if (OGADS_POSTBACK_SECRET) {
       if (!secret || secret !== OGADS_POSTBACK_SECRET) {
         return res.status(403).send("FORBIDDEN");
@@ -4053,7 +4088,7 @@ app.post("/api/mission/list", async (req, res) => {
       };
     });
 
-    res.json({ ok: true, missions });
+    res.json({ ok: true, missions: await monetagRewards.decorateMissions(user, missions) });
   } catch (err) {
     console.error("Error /api/mission/list:", err);
     res.status(500).json({ ok: false, error: "MISSION_LIST_ERROR" });
@@ -4090,7 +4125,7 @@ app.post("/api/mission/start", async (req, res) => {
     const missionKind = String(mission.kind || "").toLowerCase();
     const missionCode = String(mission.code || "");
     const isSponsorStart = missionKind === "sponsor" || missionCode.startsWith("sp_");
-    if (isSponsorStart && DISABLE_SPONSOR_MISSIONS) {
+    if (isSponsorStart) {
       return res.status(503).json({ ok: false, error: "SPONSOR_MISSIONS_DISABLED" });
     }
 
@@ -4180,7 +4215,7 @@ app.post("/api/mission/complete", async (req, res) => {
     const missionCode = String(mission.code || "");
     const isSponsorMission =
       missionKind === "sponsor" || missionCode.startsWith("sp_");
-    if (isSponsorMission && DISABLE_SPONSOR_MISSIONS) {
+    if (isSponsorMission) {
       return res.status(503).json({ ok: false, error: "SPONSOR_MISSIONS_DISABLED" });
     }
 
