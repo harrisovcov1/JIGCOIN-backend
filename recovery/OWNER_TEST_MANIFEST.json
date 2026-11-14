@@ -1,0 +1,48 @@
+{
+  "release": "JIGCOIN_backend_owner_test_20261114",
+  "prepared_at_utc": "2026-11-14T02:10:30.592224+00:00",
+  "repository": "harrisovcov1/JIGCOIN-backend",
+  "baseline_commit": "12e348ad23c783360e54801da51d66a85bf4d550",
+  "status": "prepared_not_deployed",
+  "database_migration_required": false,
+  "frontend_change_required": false,
+  "test_results": {
+    "backend_passed": 28,
+    "backend_failed": 0,
+    "backend_skipped": 0,
+    "restored_read_only_tables_preserved": 60,
+    "restored_read_only_rows_preserved": 3812
+  },
+  "files": [
+    {
+      "path": "index.js",
+      "bytes": 203873,
+      "sha256": "212d74015f276bf5a389b04a5144246ed57a9c7e0656b084d43ad8ad65478bdb"
+    },
+    {
+      "path": "lib/recoveryTestAccess.js",
+      "bytes": 3987,
+      "sha256": "715be7065a8bf332656ce6069e538f20bfb14c314ee6013640ee45f02916abfa"
+    },
+    {
+      "path": "test/recovery-safety.test.js",
+      "bytes": 12475,
+      "sha256": "a843fb324ccdce0b28e3881abefc890d57e22049ab63307de2d7698656f60c5f"
+    },
+    {
+      "path": "test/monetag-postgres.test.js",
+      "bytes": 16663,
+      "sha256": "f07faf2d70147e68654fd0f70bac8722bc03392424e58a6e1d82df238e4ecb12"
+    },
+    {
+      "path": "test/helpers/httpApp.cjs",
+      "bytes": 3304,
+      "sha256": "2d59aed013f1962d591d69abbe1cf1da52088fd21b85bb7da0cd90577c29da6d"
+    },
+    {
+      "path": "recovery/OWNER_TEST_SETUP.md",
+      "bytes": 6021,
+      "sha256": "470f5967aa30881110de8ecd6a286f93ac1ed429bcf62feee6daa1678aa2b708"
+    }
+  ]
+}

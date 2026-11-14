@@ -13,6 +13,7 @@ const { ensureIdempotencyKeyTx, completeIdempotencyKeyTx } = require("./lib/idem
 const powerups = require("./lib/powerups");
 const { loadConfig } = require("./lib/config");
 const { createMonetagRewards } = require("./lib/monetagRewards");
+const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const crypto = require("crypto");
 const Stripe = require("stripe");
 const fetch = require("node-fetch");
@@ -613,6 +614,10 @@ app.use(async (req, res, next) => {
   } catch (e) {}
   next();
 });
+
+// Optional single-account ad test; all other requests still reach maintenance.
+app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -2460,7 +2465,7 @@ async function getGlobalRankForUser(user) {
 }
 
 // ------------ Build state for frontend ------------
-async function buildClientState(user) {
+async function buildClientState(user, { readOnly = false } = {}) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?startapp=ref_${user.telegram_id}`;
 
   const { rank, total } = await getGlobalRankForUser(user);
@@ -2520,7 +2525,7 @@ async function buildClientState(user) {
       && lastDay !== yesterday
     );
 
-    if (shouldBreak && !hasMomentumShield) {
+    if (!readOnly && shouldBreak && !hasMomentumShield) {
       await pool.query(
         `update public.users set streak_broken_at = now() where id = $1 and streak_broken_at is null`,
         [user.id]

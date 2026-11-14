@@ -5,59 +5,11 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
-const http = require("node:http");
-const express = require("express");
 
 const root = path.resolve(__dirname, "..");
 const quiet = { log() {}, warn() {}, error() {} };
 
-// Execute the actual entrypoint with Express, but no credentials, database,
-// Telegram connection, payment provider, or public listener.
-async function startIsolatedApp(t, maintenance) {
-  const app = express();
-  app.listen = () => {};
-  let configReads = 0;
-  const pool = { async query() { return { rows: [{ c: 0, n: 0 }] }; } };
-  const dependencies = {
-    express: Object.assign(() => app, express),
-    cors: require("cors"),
-    telegraf: { Telegraf: class { start() {} command() {} } },
-    "./lib/db": { pool, withTransaction: async () => { throw Error("Unexpected transaction"); } },
-    "./lib/ledger": {},
-    "./lib/jobs": {},
-    "./lib/idempotency": {},
-    "./lib/powerups": {},
-    "./lib/monetagRewards": require("../lib/monetagRewards"),
-    "./lib/config": { async loadConfig() { configReads++; return {}; } },
-    crypto: require("node:crypto"),
-    stripe: class { constructor() { throw Error("Unexpected payment client"); } },
-    "node-fetch": async () => { throw Error("Unexpected external request"); },
-  };
-  vm.runInNewContext(fs.readFileSync(path.join(root, "index.js"), "utf8"), {
-    require(name) {
-      if (!Object.hasOwn(dependencies, name)) throw Error(`Unexpected import: ${name}`);
-      return dependencies[name];
-    },
-    process: {
-      env: {
-        BOT_TOKEN: "offline-test-placeholder", DATABASE_URL: "offline-test-placeholder",
-        MAINTENANCE_MODE: maintenance ? "1" : "0", AUTO_MIGRATE: "0",
-        RUN_MODE: "api", DISABLE_BOT_POLLING: "1",
-      },
-      exit() { throw Error("Unexpected process exit"); },
-    },
-    console: quiet, Buffer, URL, URLSearchParams, setTimeout, clearTimeout,
-  }, { filename: "index.js", timeout: 2000 });
-  await new Promise(resolve => setImmediate(resolve));
-  const server = http.createServer(app);
-  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
-  return {
-    url: `http://127.0.0.1:${server.address().port}`,
-    configReads: () => configReads,
-    middlewareCount: () => app._router.stack.length,
-  };
-}
+const { startIsolatedApp, signedInitData } = require("./helpers/httpApp.cjs");
 
 test("maintenance blocks app, checkout, payout and callback handlers before they execute", async t => {
   const app = await startIsolatedApp(t, true);
@@ -116,6 +68,113 @@ test("Monetag receiver stays reachable during app maintenance but requires its p
   assert.equal(response.status,503);
   assert.equal((await response.json()).error,"MONETAG_NOT_CONFIGURED");
   assert.equal(response.headers.get("cache-control"),"no-store");
+});
+
+// All identities and tokens in these tests are synthetic. Exercise the actual
+// entrypoint's HMAC verifier rather than substituting a successful login.
+const testEnv = {
+  RECOVERY_TEST_ENABLED: "1", RECOVERY_TEST_TELEGRAM_ID: "10001",
+  MONETAG_ZONE_ID: "12257359", MONETAG_POSTBACK_SECRET: "a".repeat(64),
+  MONETAG_REWARDS_ENABLED: "0", DISABLE_AD_REWARDS: "1", DISABLE_SPONSOR_MISSIONS: "1",
+  DISABLE_WITHDRAWALS: "1",
+};
+
+async function post(app, endpoint, body) {
+  const response = await fetch(app.url+endpoint, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  return { status:response.status, cache:response.headers.get("cache-control"), body:await response.json() };
+}
+function readOnlyTestPool({ missing = false, system = false } = {}) {
+  const queries=[];
+  return {queries, async query(sql, args) {
+    queries.push({sql,args});
+    assert.match(sql.trim(),/^SELECT/i,"state and mission listing must not write");
+    if (/telegram_id\s*=\s*\$1/i.test(sql)) return { rows:missing?[]:[{
+      id:23,telegram_id:"10001",balance:"1234",energy:12,streak_count:4,
+      last_checkin_at:"2020-01-01T00:00:00Z",is_system_user:system,has_completed_onboarding:false,
+    }] };
+    if (/SELECT code,kind/.test(sql)) return {rows:[{code:"sp_visit_partner",kind:"sponsor"}]};
+    if (/COUNT\(\*\)/i.test(sql)) return {rows:[{count:"1"}]};
+    return {rows:[]};
+  }};
+}
+
+test("recovery access requires its explicit switch, a valid numeric ID, and maintenance", async t => {
+  for (const patch of [{RECOVERY_TEST_ENABLED:"0"},{RECOVERY_TEST_TELEGRAM_ID:""},
+    {RECOVERY_TEST_TELEGRAM_ID:"10001,10002"},{RECOVERY_TEST_TELEGRAM_ID:"9007199254740992"}]) {
+    const app=await startIsolatedApp(t,true,{env:{...testEnv,...patch}});
+    const r=await post(app,"/api/state",{initData:signedInitData()});
+    assert.equal(r.status,503); assert.equal(r.body.error,"MAINTENANCE_MODE");
+  }
+  const pool=readOnlyTestPool();
+  const app=await startIsolatedApp(t,false,{pool,env:testEnv});
+  const r=await post(app,"/api/mission/start",{initData:signedInitData(),code:"sp_visit_partner"});
+  assert.equal(r.body.error,"AD_REWARDS_UNAVAILABLE","test exception must vanish when maintenance is off");
+});
+
+test("forged, wrong-account, expired, future and duplicate Telegram data cannot enter recovery", async t => {
+  const pool=readOnlyTestPool();
+  const app=await startIsolatedApp(t,true,{pool,env:testEnv});
+  for (const initData of ["",signedInitData(10002),signedInitData(10001,{token:"wrong"}),
+    signedInitData(10001,{age:3605}),signedInitData(10001,{age:-120}),signedInitData(10001,{duplicate:true})]) {
+    const r=await post(app,"/api/state",{initData,telegram_id:10001,user:{id:10001},verified:true});
+    assert.equal(r.status,503); assert.equal(r.body.error,"MAINTENANCE_MODE");
+  }
+  assert.equal(pool.queries.length,0,"unverified identities cannot query or create a user");
+});
+
+test("authorized recovery state and mission listing are read-only with public rewards disabled", async t => {
+  const pool=readOnlyTestPool();
+  const app=await startIsolatedApp(t,true,{pool,env:testEnv,powerups:{getActivePowerupsForUser:async()=>[]}});
+  const auth={initData:signedInitData()};
+  const state=await post(app,"/api/state",auth);
+  assert.equal(state.status,200); assert.equal(state.body.balance,1234);
+  assert.equal(state.body.streak_count,4); assert.equal(state.body.recovery_test,true);
+  assert.equal(state.body.onboarding_required,false,"test UI skips onboarding without persisting completion");
+  assert.equal(state.cache,"no-store");
+  const list=await post(app,"/api/mission/list",{...auth,kind:"anything",include_boost_sponsor_missions:true});
+  assert.equal(list.status,200); assert.equal(list.body.missions.length,1);
+  assert.equal(list.body.missions[0].code,"sp_visit_partner");
+  assert.equal(list.body.missions[0].status,"available");
+  assert.equal(list.body.missions[0].payout_amount,200);
+  assert.ok(!JSON.stringify(list.body).includes(testEnv.MONETAG_POSTBACK_SECRET));
+  assert.ok(pool.queries.every(q=>/^SELECT/i.test(q.sql.trim())));
+});
+
+test("recovery does not create missing accounts or permit system accounts", async t => {
+  for (const flags of [{missing:true},{system:true}]) {
+    const pool=readOnlyTestPool(flags);
+    const app=await startIsolatedApp(t,true,{pool,env:testEnv});
+    const r=await post(app,"/api/mission/start",{initData:signedInitData(),code:"sp_visit_partner"});
+    assert.equal(r.status,403); assert.equal(r.body.error,"RECOVERY_TEST_ACCOUNT_MISSING");
+    assert.equal(pool.queries.length,1);
+  }
+});
+
+test("even the tester cannot access payments, withdrawals, taps, admin, other quests or legacy ads", async t => {
+  const pool=readOnlyTestPool();
+  const app=await startIsolatedApp(t,true,{pool,env:testEnv});
+  const auth={initData:signedInitData(),telegram_id:10001};
+  for (const endpoint of ["/api/tap","/api/tapPacket","/api/task","/api/onboarding/complete",
+    "/api/payments/create-checkout","/api/vip/buy","/api/withdraw/request","/api/admin/withdraw/update",
+    "/api/boost/requestAd","/api/boost/completeAd","/api/boost/double","/api/boost/energy"]) {
+    const r=await post(app,endpoint,{...auth,method:"points"});
+    assert.equal(r.status,503,endpoint); assert.equal(r.body.error,"MAINTENANCE_MODE",endpoint);
+  }
+  assert.equal(pool.queries.length,0);
+  for (const code of ["sp_watch_content","sp_double_points","daily","sp_visit_partner "]) {
+    const r=await post(app,"/api/mission/start",{...auth,code});
+    assert.equal(r.status,503); assert.equal(r.body.error,"AD_REWARDS_UNAVAILABLE");
+  }
+  const get=await fetch(app.url+"/api/state?initData="+encodeURIComponent(auth.initData));
+  assert.equal(get.status,503,"query-string authentication cannot bypass maintenance");
+});
+
+test("recovery database failures return a sanitized error instead of secret-bearing details", async t => {
+  const pool={async query(){throw Object.assign(new Error("private connection value must not appear"),{code:"08006"});}};
+  const app=await startIsolatedApp(t,true,{pool,env:testEnv});
+  const r=await post(app,"/api/state",{initData:signedInitData()});
+  assert.equal(r.status,503); assert.equal(r.body.error,"REWARD_SERVICE_UNAVAILABLE");
+  assert.ok(!JSON.stringify(r).includes("private connection"));
 });
 
 test("an unimplemented payout provider never returns a success identifier", async () => {

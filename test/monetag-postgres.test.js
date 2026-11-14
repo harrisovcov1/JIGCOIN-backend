@@ -7,6 +7,7 @@ const crypto = require("node:crypto");
 const { Pool } = require("pg");
 const { createMonetagRewards, CODES } = require("../lib/monetagRewards");
 const { applyBalanceChangeTx } = require("../lib/ledger");
+const { startIsolatedApp, signedInitData } = require("./helpers/httpApp.cjs");
 
 // Opt-in, isolated PostgreSQL only: creates a NEW disposable database on loopback.
 // Never reads DATABASE_URL, customer rows, a backup or provider credentials.
@@ -73,6 +74,47 @@ pgTest("only server-owned placements can create attempts; no secret is exposed",
   await assert.rejects(rewards.start(user, CODES[0]), { code: "AD_RETRY_LATER" });
   await assert.rejects(rewards.claim(user, CODES[0], a.ymid), { code: "AD_CONFIRMATION_PENDING" });
   assert.deepEqual(await counts(), { ledger: 0, balance: "0", receipts: 0 });
+});
+
+pgTest("maintenance test HTTP flow credits one verified quest once, with public rewards still off", async t => {
+  const appEnv = { ...env, RECOVERY_TEST_ENABLED:"1", RECOVERY_TEST_TELEGRAM_ID:String(user.telegram_id),
+    MONETAG_REWARDS_ENABLED:"0", DISABLE_AD_REWARDS:"1", DISABLE_SPONSOR_MISSIONS:"1", DISABLE_WITHDRAWALS:"1" };
+  const options = { pool, withTransaction:transaction, ledger:{applyBalanceChangeTx},
+    powerups:{getActivePowerupsForUser:async()=>[]}, env:appEnv };
+  const app=await startIsolatedApp(t,true,options);
+  const post=async (endpoint, body={})=>{
+    const r=await fetch(app.url+endpoint,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({initData:signedInitData(Number(user.telegram_id)),...body})});
+    return {status:r.status,body:await r.json()};
+  };
+  const list=await post("/api/mission/list");
+  assert.equal(list.status,200); assert.equal(list.body.missions.length,1);
+  assert.equal(list.body.missions[0].status,"available");
+  const a=await post("/api/mission/start",{code:CODES[0]});
+  assert.equal(a.status,200); assert.equal(a.body.provider,"monetag");
+  assert.deepEqual(await counts(),{ledger:0,balance:"0",receipts:0});
+  assert.equal((await post("/api/mission/complete",{code:CODES[0],attempt_id:a.body.ymid})).body.error,"AD_CONFIRMATION_PENDING");
+  assert.equal((await post("/api/mission/start",{code:CODES[1]})).body.error,"AD_REWARDS_UNAVAILABLE");
+  assert.equal((await post("/api/mission/list",{initData:signedInitData(Number(other.telegram_id)),telegram_id:user.telegram_id})).status,503);
+  const callback=await fetch(app.url+"/postback/monetag?"+new URLSearchParams(event(a.body)));
+  assert.equal(callback.status,200); assert.equal((await callback.json()).ok,true);
+  assert.deepEqual(await counts(),{ledger:0,balance:"0",receipts:1},"receipt alone never credits coins");
+  const confirmed=await post("/api/mission/list");
+  assert.equal(confirmed.body.missions[0].status,"claimable");
+  const claims=await Promise.all(Array.from({length:6},()=>post("/api/mission/complete",{code:CODES[0],attempt_id:a.body.ymid})));
+  assert.ok(claims.every(c=>c.status===200));
+  assert.equal(claims.filter(c=>!c.body.already_claimed).length,1);
+  assert.deepEqual(await counts(),{ledger:1,balance:"200",receipts:1});
+  const state=await post("/api/state");
+  assert.equal(state.status,200); assert.equal(state.body.balance,200);
+  const cool=await post("/api/mission/list");
+  assert.equal(cool.body.missions[0].status,"cooldown");
+  assert.ok(cool.body.missions[0].cooldown_remaining_seconds>=86398);
+  assert.equal((await post("/api/mission/start",{code:CODES[0]})).body.error,"MISSION_COOLDOWN");
+  const disabled=await startIsolatedApp(t,true,{...options,env:{...appEnv,RECOVERY_TEST_ENABLED:"0"}});
+  const closed=await fetch(disabled.url+"/api/mission/list",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({initData:signedInitData(Number(user.telegram_id))})});
+  assert.equal(closed.status,503); assert.equal((await closed.json()).error,"MAINTENANCE_MODE");
 });
 
 pgTest("bad/missing secrets, wrong zone, wrong owner and malformed macros cannot confirm", async () => {
