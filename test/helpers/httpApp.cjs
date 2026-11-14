@@ -23,6 +23,7 @@ async function startIsolatedApp(t, maintenance, options = {}) {
     "./lib/jobs": {},
     "./lib/idempotency": {},
     "./lib/powerups": options.powerups || {},
+    "./lib/gameplay": require("../../lib/gameplay"),
     "./lib/monetagRewards": require("../../lib/monetagRewards"),
     "./lib/recoveryTestAccess": require("../../lib/recoveryTestAccess"),
     "./lib/config": { async loadConfig() { configReads++; return {}; } },

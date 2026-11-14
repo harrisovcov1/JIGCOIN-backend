@@ -93,6 +93,7 @@ function readOnlyTestPool({ missing = false, system = false } = {}) {
       last_checkin_at:"2020-01-01T00:00:00Z",is_system_user:system,has_completed_onboarding:false,
     }] };
     if (/SELECT code,kind/.test(sql)) return {rows:[{code:"sp_visit_partner",kind:"sponsor"}]};
+    if (/SELECT ranked.position/.test(sql)) return {rows:[{position:"1",total:"1"}]};
     if (/COUNT\(\*\)/i.test(sql)) return {rows:[{count:"1"}]};
     return {rows:[]};
   }};
@@ -150,18 +151,18 @@ test("recovery does not create missing accounts or permit system accounts", asyn
   }
 });
 
-test("even the tester cannot access payments, withdrawals, taps, admin, other quests or legacy ads", async t => {
+test("even the tester cannot access payments, withdrawals, legacy taps, admin or legacy ads", async t => {
   const pool=readOnlyTestPool();
   const app=await startIsolatedApp(t,true,{pool,env:testEnv});
   const auth={initData:signedInitData(),telegram_id:10001};
-  for (const endpoint of ["/api/tap","/api/tapPacket","/api/task","/api/onboarding/complete",
+  for (const endpoint of ["/api/tap","/api/task","/api/onboarding/complete",
     "/api/payments/create-checkout","/api/vip/buy","/api/withdraw/request","/api/admin/withdraw/update",
     "/api/boost/requestAd","/api/boost/completeAd","/api/boost/double","/api/boost/energy"]) {
     const r=await post(app,endpoint,{...auth,method:"points"});
     assert.equal(r.status,503,endpoint); assert.equal(r.body.error,"MAINTENANCE_MODE",endpoint);
   }
   assert.equal(pool.queries.length,0);
-  for (const code of ["sp_watch_content","sp_double_points","daily","sp_visit_partner "]) {
+  for (const code of ["unknown_ad","daily","sp_visit_partner "]) {
     const r=await post(app,"/api/mission/start",{...auth,code});
     assert.equal(r.status,503); assert.equal(r.body.error,"AD_REWARDS_UNAVAILABLE");
   }

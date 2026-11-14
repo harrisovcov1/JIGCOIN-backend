@@ -13,6 +13,7 @@ const { ensureIdempotencyKeyTx, completeIdempotencyKeyTx } = require("./lib/idem
 const powerups = require("./lib/powerups");
 const { loadConfig } = require("./lib/config");
 const { createMonetagRewards } = require("./lib/monetagRewards");
+const { createGameplay } = require("./lib/gameplay");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const crypto = require("crypto");
 const Stripe = require("stripe");
@@ -544,7 +545,11 @@ async function fulfillStreakRestoreByTelegramId({ telegramId, sku, provider, pro
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
-const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env });
+const getEnergyCap = user => getEffectiveMaxEnergy(user, getStreakMetaFromUser(user));
+const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
+  getMultiplier: user => Number(getStreakMetaFromUser(user)?.tap_multiplier || 1),
+  packetMax: TAP_PACKET_MAX, vipDailyCap: VIP_DAILY_TAP_CAP });
+const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
 app.use(cors());
 // Capture raw body for Stripe webhook signature verification (without breaking JSON parsing)
@@ -617,7 +622,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -2089,10 +2094,13 @@ async function getOrCreateUserFromInitData(req) {
     const { rows: created } = await pool.query(
       `insert into public.users (telegram_id, username, first_name, created_at)
        values ($1::bigint, $2, $3, now())
+       ON CONFLICT (telegram_id) DO NOTHING
        returning *`,
       [telegramUserId, username, firstName],
     );
-    user = created[0];
+    // AFTER INSERT bonus triggers can change balance after RETURNING was formed.
+    // Re-read committed state, also handling simultaneous first-open requests.
+    user = (await pool.query("SELECT * FROM public.users WHERE telegram_id=$1::bigint", [telegramUserId])).rows[0];
   }
 
   return user;
@@ -2445,9 +2453,9 @@ async function getGlobalRankForUser(user) {
   // keeps the position and player count in the same database snapshot.
   const result = await pool.query(
     `
-    SELECT ranked.position, ranked.total
+    SELECT ranked.position, ranked.total, ranked.balance
     FROM (
-      SELECT id,
+      SELECT id, balance,
         ROW_NUMBER() OVER (ORDER BY balance DESC, telegram_id ASC) AS position,
         COUNT(*) OVER () AS total
       FROM public.users
@@ -2457,7 +2465,7 @@ async function getGlobalRankForUser(user) {
     [user.id]
   );
   const row = result.rows[0];
-  return row ? { rank: Number(row.position), total: Number(row.total) }
+  return row ? { rank: Number(row.position), total: Number(row.total), balance: row.balance == null ? null : Number(row.balance) }
              : { rank: null, total: 0 };
 }
 
@@ -2465,7 +2473,10 @@ async function getGlobalRankForUser(user) {
 async function buildClientState(user, { readOnly = false } = {}) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?startapp=ref_${user.telegram_id}`;
 
-  const { rank, total } = await getGlobalRankForUser(user);
+  const { rank, total, balance: rankedBalance } = await getGlobalRankForUser(user);
+  // This balance and position came from the same database snapshot. A reward
+  // committed between the initial account read and ranking cannot mix versions.
+  if (Number.isFinite(rankedBalance)) user = { ...user, balance: rankedBalance };
 
   let doubleBoostActive = false;
   let doubleBoostUntil = null;
@@ -3079,14 +3090,8 @@ app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // Refill energy based on time passed
-    user = await applyEnergyRegen(user);
-
-    // NOTE: anti-bot / rate limiting must be enforced on write endpoints (e.g. /api/tapPacket),
-    // not on /api/state. Otherwise normal UI refreshes can incorrectly trigger bans.
-
-    // Ensure daily counters reset if a new day started
-    user = await ensureDailyReset(user);
+    // Project regeneration without stale read/modify/write races against taps.
+    user = gameplay.project(user);
 
     const state = await buildClientState(user);
     res.json(state);
@@ -3298,156 +3303,13 @@ app.post("/api/tap", async (req, res) => {
 
 // Tap packet route – batch taps for better anti-bot validation + lower server load
 // Body: { count: number, client?: {...} }
-app.post("/api/tapPacket", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
+app.post("/api/tapPacket", monetagRewards.handler(async req => {
+  const user = await getOrCreateUserFromInitData(req);
+  if (!hit(`tapburst:u:${user.telegram_id}`, 6, 1000)) throw Object.assign(new Error("TAP_RATE_LIMIT"), { code: "TAP_RATE_LIMIT", status: 429 });
+  const result = await gameplay.tap(user, req.body);
+  return { ...await buildClientState(result.user), ...result.response };
+}));
 
-    if (!hit(`tapburst:u:${user.telegram_id}`, 6, 1000)) {
-      return res.status(429).json({ ok: false, error: "TAP_RATE_LIMIT" });
-    }
-    if (user.banned_until && new Date(user.banned_until) > new Date()) {
-      const state = await buildClientState(user);
-      return res.status(403).json({ ...state, ok: false, reason: "BANNED" });
-    }
-
-    const fp = req._fp || getClientFingerprint(req);
-    if (!hit(`tapburst:${fp}`, 12, 1000)) {
-      return res.status(429).json({ ok: false, error: "TAP_RATE_LIMIT" });
-    }
-
-    // Idempotency: if a client sends the same packet twice (e.g., after the WebView is killed),
-    // process it only once.
-    const packetId = (req.body.packet_id || "").toString().trim();
-    if (packetId) {
-      try {
-        const ins = await pool.query(
-          `INSERT INTO public.tap_packets (packet_id, telegram_id) VALUES ($1, $2)
-           ON CONFLICT (packet_id) DO NOTHING
-           RETURNING packet_id;`,
-          [packetId, user.telegram_id]
-        );
-        if (ins.rowCount === 0) {
-          // Already processed this packet_id.
-          const fresh = await getUserByTelegramId(user.telegram_id);
-          const state = await buildClientState(fresh || user);
-          return res.json({ ...state, ok: true, applied: 0, gained: 0, duplicate: true });
-        }
-      } catch (e) {
-        // If tap_packets table doesn't exist for some reason, fail open (no idempotency).
-        console.warn("tap_packets insert failed (continuing):", e.message || e);
-      }
-    }
-
-    const countRaw = Number(req.body.count || 0);
-    const count = Math.max(1, Math.min(TAP_PACKET_MAX, Math.floor(countRaw)));
-    if (!Number.isFinite(countRaw) || countRaw <= 0) {
-      return res.status(400).json({ ok: false, error: "BAD_COUNT" });
-    }
-
-    user = await applyEnergyRegen(user);
-    user = await ensureDailyReset(user);
-
-    // Anti-bot packet timing check
-    try {
-      const lastTap = user.last_tap_at ? new Date(user.last_tap_at) : null;
-      const nowTs = new Date();
-      if (lastTap && nowTs - lastTap < 250) {
-        const updFraud = await pool.query(
-          `UPDATE public.users
-           SET fraud_score = COALESCE(fraud_score,0) + 1,
-               last_tap_at = NOW(),
-               banned_until = CASE WHEN COALESCE(fraud_score,0) + 1 >= 35 THEN NOW() + INTERVAL '30 minutes' ELSE banned_until END
-           WHERE id = $1
-           RETURNING fraud_score, banned_until`,
-          [user.id]
-        );
-        user.fraud_score = updFraud.rows[0]?.fraud_score;
-        user.banned_until = updFraud.rows[0]?.banned_until;
-        if (user.banned_until && new Date(user.banned_until) > new Date()) {
-          const state = await buildClientState(user);
-          return res.status(403).json({ ...state, ok:false, reason:"BANNED" });
-        }
-      } else {
-        await pool.query(`UPDATE public.users SET last_tap_at = NOW() WHERE id = $1`, [user.id]);
-      }
-    } catch (e) {}
-
-    const currentEnergy = Number(user.energy || 0);
-    if (currentEnergy <= 0) {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "NO_ENERGY" });
-    }
-
-    const vipActive = user.vip_until && new Date(user.vip_until) > new Date();
-    const maxTapsPerDay = vipActive ? VIP_DAILY_TAP_CAP : 5000;
-    const currentTaps = Number(user.taps_today || 0);
-    if (currentTaps >= maxTapsPerDay) {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "MAX_TAPS_REACHED" });
-    }
-
-    const allowedByCap = Math.max(0, maxTapsPerDay - currentTaps);
-    const allowedByEnergy = Math.max(0, currentEnergy);
-    const n = Math.max(1, Math.min(count, allowedByCap, allowedByEnergy));
-
-    const basePerTap = 1;
-    const now = new Date();
-    let perTap = basePerTap;
-    if (user.double_boost_until) {
-      const until = new Date(user.double_boost_until);
-      if (!isNaN(until) && until > now) perTap = basePerTap * 2;
-    }
-
-    // Streak multiplier (only when streak is active)
-    try {
-      const streakMeta = getStreakMetaFromUser(user);
-      if (streakMeta && streakMeta.active && Number(streakMeta.tap_multiplier || 1) > 1) {
-        perTap = perTap * Number(streakMeta.tap_multiplier || 1);
-      }
-    } catch (e) {}
-
-    const gained = Math.max(1, Math.floor(n * perTap));
-
-    let updatedUser;
-    await withTransaction(async (client) => {
-      // 1) Apply balance change via ledger inside the same transaction.
-      await applyBalanceChangeTx(client, {
-        userId: user.id,
-        delta: gained,
-        reason: "tap_reward",
-        refType: "tap_packet",
-        refId: null,
-        eventType: "tap",
-      });
-
-      // 2) Update energy + tap counters but do not touch balance here.
-      const upd = await client.query(
-        `
-        UPDATE public.users
-        SET energy         = energy - $2,
-            today_farmed   = today_farmed + $1,
-            taps_today     = taps_today + $2,
-            last_energy_ts = NOW()
-        WHERE id = $3
-        RETURNING *;
-        `,
-        [gained, n, user.id]
-      );
-
-      if (!upd.rowCount) {
-        throw new Error("Tap packet user update failed");
-      }
-      updatedUser = upd.rows[0];
-    });
-
-    maybeActivateReferral(updatedUser, 'tap');
-    const state = await buildClientState(updatedUser);
-    return res.json({ ...state, ok: true, applied: n, gained });
-  } catch (err) {
-    console.error("Error /api/tapPacket:", err);
-    res.status(500).json({ ok: false, error: "TAP_PACKET_ERROR" });
-  }
-});
 // Energy boost – refill energy via action or by spending points (hybrid)
 app.post("/api/boost/energy", async (req, res) => {
   try {

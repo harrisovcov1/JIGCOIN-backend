@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { Pool } = require("pg");
-const { createMonetagRewards, CODES } = require("../lib/monetagRewards");
+const { createMonetagRewards, CODES, ALL_CODES, BOOST_CODES } = require("../lib/monetagRewards");
 const { applyBalanceChangeTx } = require("../lib/ledger");
 const { startIsolatedApp, signedInitData } = require("./helpers/httpApp.cjs");
 
@@ -38,7 +38,11 @@ before(async () => {
   await admin.query(`CREATE DATABASE ${database}`);
   pool = new Pool({ ...connection, database, max: 16 });
   await pool.query(`
-    CREATE TABLE public.users (id bigserial PRIMARY KEY, telegram_id bigint NOT NULL, balance bigint NOT NULL DEFAULT 0);
+    CREATE TABLE public.users (id bigserial PRIMARY KEY, telegram_id bigint NOT NULL, balance bigint NOT NULL DEFAULT 0,
+      energy integer DEFAULT 0,max_energy integer DEFAULT 50,last_energy_ts timestamptz DEFAULT now(),double_boost_until timestamptz,
+      today_farmed integer DEFAULT 0,taps_today integer DEFAULT 0,last_reset date DEFAULT CURRENT_DATE,last_tap_at timestamptz,
+      vip_until timestamptz,banned_until timestamptz);
+    CREATE TABLE public.tap_packets(packet_id text PRIMARY KEY,telegram_id bigint NOT NULL);
     CREATE TABLE public.missions (id serial PRIMARY KEY, code text NOT NULL UNIQUE, kind text, is_active boolean DEFAULT true,
       sponsor_claims_today integer DEFAULT 1,max_claims_per_day integer DEFAULT 1);
     CREATE TABLE public.user_missions (id serial PRIMARY KEY,user_id integer REFERENCES public.users(id),mission_id integer REFERENCES public.missions(id),
@@ -48,16 +52,19 @@ before(async () => {
     DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon; END IF;
       IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated; END IF; END $$;
   `);
+  for (const code of ALL_CODES) await pool.query("INSERT INTO public.missions(code,kind) VALUES($1,'sponsor')",[code]);
   const migration = fs.readFileSync(path.join(__dirname, "../sql/migrations/006_monetag_rewards.sql"), "utf8");
   await pool.query(migration);
   await pool.query(migration); // Restart-safe additive migration.
+  const expansion=fs.readFileSync(path.join(__dirname,"../sql/migrations/007_seven_verified_rewards.sql"),"utf8");
+  await pool.query(expansion); await pool.query(expansion);
   await pool.query(`CREATE TRIGGER trg_enforce_daily_sponsor_cap BEFORE UPDATE OF claimed_at ON public.user_missions
     FOR EACH ROW EXECUTE FUNCTION public.enforce_daily_sponsor_cap()`);
 });
 beforeEach(async () => {
   if (!port) return;
-  await pool.query("TRUNCATE jigcoin_internal.monetag_events,jigcoin_internal.ad_attempts,jigcoin_internal.reward_placements,public.user_missions,public.user_balance_ledger,public.users,public.missions RESTART IDENTITY CASCADE");
-  for (const code of CODES) await pool.query("INSERT INTO public.missions(code,kind) VALUES($1,'sponsor')", [code]);
+  await pool.query("TRUNCATE jigcoin_internal.tap_claims,public.tap_packets,jigcoin_internal.monetag_events,jigcoin_internal.ad_attempts,jigcoin_internal.reward_placements,public.user_missions,public.user_balance_ledger,public.users,public.missions RESTART IDENTITY CASCADE");
+  for (const code of ALL_CODES) await pool.query("INSERT INTO public.missions(code,kind) VALUES($1,'sponsor')", [code]);
   [user, other] = (await pool.query("INSERT INTO public.users(telegram_id) VALUES(10001),(10002) RETURNING *")).rows;
   rewards = service();
 });
@@ -88,13 +95,13 @@ pgTest("maintenance test HTTP flow credits one verified quest once, with public 
     return {status:r.status,body:await r.json()};
   };
   const list=await post("/api/mission/list");
-  assert.equal(list.status,200); assert.equal(list.body.missions.length,1);
+  assert.equal(list.status,200); assert.equal(list.body.missions.length,7);
   assert.equal(list.body.missions[0].status,"available");
   const a=await post("/api/mission/start",{code:CODES[0]});
   assert.equal(a.status,200); assert.equal(a.body.provider,"monetag");
   assert.deepEqual(await counts(),{ledger:0,balance:"0",receipts:0});
   assert.equal((await post("/api/mission/complete",{code:CODES[0],attempt_id:a.body.ymid})).body.error,"AD_CONFIRMATION_PENDING");
-  assert.equal((await post("/api/mission/start",{code:CODES[1]})).body.error,"AD_REWARDS_UNAVAILABLE");
+  assert.equal((await post("/api/mission/start",{code:CODES[1]})).status,200);
   assert.equal((await post("/api/mission/list",{initData:signedInitData(Number(other.telegram_id)),telegram_id:user.telegram_id})).status,503);
   const callback=await fetch(app.url+"/postback/monetag?"+new URLSearchParams(event(a.body)));
   assert.equal(callback.status,200); assert.equal((await callback.json()).ok,true);
@@ -243,7 +250,7 @@ pgTest("RLS blocks browser access even if schema and table grants are accidental
   const flags = (await pool.query(`SELECT relrowsecurity FROM pg_class c
     JOIN pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname='jigcoin_internal' AND c.relkind='r'`)).rows;
-  assert.equal(flags.length,3);
+  assert.equal(flags.length,4);
   assert.ok(flags.every(r=>r.relrowsecurity));
   const client=await pool.connect();
   try {
@@ -260,4 +267,59 @@ pgTest("RLS blocks browser access even if schema and table grants are accidental
       await client.query("ROLLBACK"); // Restores both original grants and role.
     }
   } finally { await client.query("ROLLBACK"); client.release(); }
+});
+
+pgTest("all seven placements fulfill exactly once; boost receipts never add coin ledger entries", async () => {
+  const {createGameplay}=require("../lib/gameplay");
+  const gameplay=createGameplay({pool,withTransaction:transaction,applyBalanceChangeTx,getEnergyCap:()=>50});
+  for (const code of ALL_CODES) {
+    const a=await rewards.start(user,code);
+    await assert.rejects(rewards.claim(user,code,a.ymid),{code:"AD_CONFIRMATION_PENDING"});
+    await Promise.all(Array.from({length:5},()=>rewards.postback(event(a))));
+    const claims=await Promise.all(Array.from({length:8},()=>rewards.claim(user,code,a.ymid)));
+    assert.equal(claims.filter(c=>!c.already_claimed).length,1,code);
+  }
+  const c=await counts();assert.equal(c.balance,"1000");assert.equal(c.ledger,5);assert.equal(c.receipts,7);
+  const fresh=(await pool.query("SELECT *,clock_timestamp() AS db_now FROM public.users WHERE id=$1",[user.id])).rows[0];
+  assert.equal(fresh.energy,50);
+  const seconds=(new Date(fresh.double_boost_until)-new Date(fresh.db_now))/1000;
+  assert.ok(seconds>595 && seconds<=600);
+  const packet={packet_id:crypto.randomUUID(),count:3};
+  const taps=await Promise.all(Array.from({length:6},()=>gameplay.tap(user,packet)));
+  assert.equal(taps.filter(t=>!t.response.duplicate).length,1);
+  assert.equal(taps[0].response.gained,6);
+  const after=(await pool.query("SELECT balance,energy FROM public.users WHERE id=$1",[user.id])).rows[0];
+  assert.equal(after.balance,"1006");assert.equal(after.energy,47);
+  assert.ok((await rewards.decorateMissions(user,ALL_CODES.map(code=>({code,kind:"sponsor"})))).every(m=>m.status==="cooldown"));
+});
+pgTest("boost rollback does not consume its receipt or apply a partial boost",async()=>{
+  for (const code of BOOST_CODES) {
+    const a=await rewards.start(user,code);await rewards.postback(event(a));
+    const broken=service({withTransaction:fn=>transaction(async client=>{await fn(client);throw Error("rollback");})});
+    await assert.rejects(broken.claim(user,code,a.ymid));
+    assert.equal((await pool.query("SELECT claimed_at FROM jigcoin_internal.ad_attempts WHERE ymid=$1",[a.ymid])).rows[0].claimed_at,null);
+    assert.equal((await pool.query("SELECT energy FROM public.users WHERE id=$1",[user.id])).rows[0].energy,0);
+    await rewards.claim(user,code,a.ymid);
+    if(code===BOOST_CODES[0])await pool.query("UPDATE public.users SET energy=0 WHERE id=$1",[user.id]);
+  }
+});
+pgTest("tap failure retries safely, concurrent packets cannot spend the same energy, and expired x2 is ignored",async()=>{
+  const {createGameplay}=require("../lib/gameplay");
+  const settings={pool,withTransaction:transaction,applyBalanceChangeTx,getEnergyCap:()=>50};
+  const gameplay=createGameplay(settings);
+  await pool.query("UPDATE public.users SET energy=5,last_energy_ts=now(),double_boost_until=now()-interval '1 second' WHERE id=$1",[user.id]);
+  const packet={packet_id:crypto.randomUUID(),count:4};
+  const broken=createGameplay({...settings,applyBalanceChangeTx:async(c,a)=>{await applyBalanceChangeTx(c,a);throw Error("fail");}});
+  await assert.rejects(broken.tap(user,packet));assert.equal((await counts()).balance,"0");
+  const results=await Promise.all([gameplay.tap(user,packet),gameplay.tap(user,{packet_id:crypto.randomUUID(),count:4})]);
+  assert.equal(results.reduce((n,r)=>n+r.response.applied,0),5);
+  assert.equal((await counts()).balance,"5");
+  await assert.rejects(gameplay.tap(user,{...packet,count:1}),{code:"PACKET_CONTENT_MISMATCH"});
+  assert.equal((await pool.query("SELECT energy FROM public.users WHERE id=$1",[user.id])).rows[0].energy,0);
+});
+pgTest("full energy and an active double boost do not start unnecessary ads",async()=>{
+ await pool.query("UPDATE public.users SET energy=50,double_boost_until=now()+interval '10 minutes' WHERE id=$1",[user.id]);
+ await assert.rejects(rewards.start(user,BOOST_CODES[0]),{code:"ENERGY_FULL"});
+ await assert.rejects(rewards.start(user,BOOST_CODES[1]),{code:"DOUBLE_ACTIVE"});
+ assert.equal((await pool.query("SELECT count(*)::int AS n FROM jigcoin_internal.ad_attempts")).rows[0].n,0);
 });
