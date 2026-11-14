@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.*
+*.log
+*.sql.gz
+*.backup
+*.dump
+/recovery/releases/
