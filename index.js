@@ -14,6 +14,7 @@ const powerups = require("./lib/powerups");
 const { loadConfig } = require("./lib/config");
 const { createMonetagRewards } = require("./lib/monetagRewards");
 const { createProgression } = require("./lib/progression");
+const { createStreakRewards } = require("./lib/streakRewards");
 const { createGameplay } = require("./lib/gameplay");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
@@ -413,8 +414,9 @@ function getStreakMetaFromUser(user) {
   // If broken and restore window expired, treat as permanently lost.
   const permanentlyLost = broken && (!restoreEndsAt || restoreEndsAt <= now);
 
-  // Streak is active only when not broken.
-  const active = !broken;
+  // Streak benefits require a current or previous UTC-day check-in.
+  const checkinGap = lastCheckinDay ? diffUtcDays(lastCheckinDay, utcDayString(now)) : null;
+  const active = !broken && checkinGap !== null && checkinGap >= 0 && checkinGap <= 1;
 
   const tier = getStreakTier(streakCount);
   const next = getNextTier(streakCount);
@@ -438,8 +440,8 @@ function getStreakMetaFromUser(user) {
     active,
     tier_key: tier.key,
     tier_name: tier.name,
-    tap_multiplier: Number(tier.tapMult || 1.0),
-    leaderboard_multiplier: Number(tier.tapMult || 1.0),
+    tap_multiplier: active ? Number(tier.tapMult || 1.0) : 1,
+    leaderboard_multiplier: active ? Number(tier.tapMult || 1.0) : 1,
     energy_bonus: Number(tier.energyBonus || 0),
     next_tier_key: next ? next.key : null,
     next_tier_name: next ? next.name : null,
@@ -548,11 +550,12 @@ const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 const getEnergyCap = user => getEffectiveMaxEnergy(user, getStreakMetaFromUser(user));
 const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
-  getMultiplier: user => Number(getStreakMetaFromUser(user)?.tap_multiplier || 1),
+  getMultiplier: user => { const meta=getStreakMetaFromUser(user); return meta.active ? Number(meta.tap_multiplier || 1) : 1; },
   packetMax: TAP_PACKET_MAX });
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
-const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS});
+const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS});
+const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS,streakRewards});
 const starsShop = createStarsShop({pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
 
 app.use(cors());
@@ -635,7 +638,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, progression }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, progression, streakRewards }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -4764,6 +4767,8 @@ async function handleDailyCheckin(req, res, verifiedTester = null) {
         [newStreak, todayStr, clearBrokenAt, user.id]
       );
 
+      await streakRewards.grant(client,user.id,newStreak);
+
       // Audit event
       try {
         await client.query(
@@ -5314,7 +5319,7 @@ app.post("/api/leaderboard/global", async (req, res) => {
     res.json({
       ok: true,
       me,
-      global: rows,
+      global: await streakRewards.decorate(rows),
     });
   } catch (err) {
     console.error("Error /api/leaderboard/global:", err);
@@ -5424,7 +5429,7 @@ app.post("/api/leaderboard/window", async (req, res) => {
         global_total: total,
         distance_to_next,
       },
-      window: windowRows,
+      window: await streakRewards.decorate(windowRows),
       overtake,
       threatened,
     });
@@ -5506,7 +5511,7 @@ app.post("/api/leaderboard/daily", async (req, res) => {
               daily_total: total,
             }
           : null,
-      daily: rows,
+      daily: await streakRewards.decorate(rows),
     });
   } catch (err) {
     console.error("Error /api/leaderboard/daily:", err);
@@ -5597,7 +5602,7 @@ app.post("/api/leaderboard/friends", async (req, res) => {
     res.json({
       ok: true,
       me: meEntry,
-      friends: list,
+      friends: await streakRewards.decorate(list),
       overtake,
     });
   } catch (err) {
