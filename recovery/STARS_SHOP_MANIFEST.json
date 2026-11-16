@@ -1,0 +1,80 @@
+{
+  "release": "JIGCOIN_STARS_PRIVATE_PILOT_20261116",
+  "backend_base": "2da58e10598a7ae918f95ac42afddd5188ae8342",
+  "frontend_base": "aabb52ac7022f826a517fbe6450f6dc701a48e08",
+  "live_deployed": false,
+  "payments_enabled_by_package": false,
+  "validation": {
+    "passed": 75,
+    "failed": 0,
+    "skipped_separate_postgres_tests": 17,
+    "stars_database": "PGlite 0.5.16",
+    "telegram": "mocked"
+  },
+  "files": {
+    "backend/index.js": {
+      "bytes": 200861,
+      "sha256": "afb4f87ccfc7acb6fcc9880c06e4946c8618afa19d50ee3db6accaa395f2f955"
+    },
+    "backend/lib/recoveryTestAccess.js": {
+      "bytes": 6786,
+      "sha256": "8ae4e40040ba2f8a9e2badd03ff13807bf335e7d040f9e7aa8afa89ed7f67dda"
+    },
+    "backend/lib/starsShop.js": {
+      "bytes": 13383,
+      "sha256": "0b7eed16fcb40ce428039c297dfc182fdde99880eacc556b6d9a2ab13ba9fb5b"
+    },
+    "backend/scripts/stars-admin.cjs": {
+      "bytes": 2566,
+      "sha256": "a5a679e2927c1b055ddc323f5e4acac0423bfc6dbe3560a8fecaf211bf24bba8"
+    },
+    "backend/sql/migrations/010_stars_shop.sql": {
+      "bytes": 3648,
+      "sha256": "faada326cd3e24181c2a593b884a75911c7886194c761bcd6d21bc2144f46e71"
+    },
+    "backend/test/stars-shop.test.js": {
+      "bytes": 13073,
+      "sha256": "d4e664920557c75b75e604d8446950a8a834d197537fcc0359f32214d8c4470f"
+    },
+    "backend/test/helpers/httpApp.cjs": {
+      "bytes": 3570,
+      "sha256": "1ed959454c58ec40c470b58ae6292964744fde56c61db1932c356fbc05d9dbd4"
+    },
+    "backend/recovery/STARS_SHOP_SETUP.md": {
+      "bytes": 10851,
+      "sha256": "e0c4e7747bc3b2dcb6c89105f683ce4972a27a7a3dcafeefd522bed504a492b6"
+    },
+    "backend/recovery/STARS_SHOP_METRICS.sql": {
+      "bytes": 2159,
+      "sha256": "d8e628e03b9b4e594206a35c4d0d2f4f667af0c063a31f45da6c229f9cdf9ec3"
+    },
+    "backend/recovery/CONFIGURE_STARS_WEBHOOK.ps1": {
+      "bytes": 2591,
+      "sha256": "70f2db3199a079ce210f86ac24d6ca92efcd291b3851d01d0dc7ab863f026baf"
+    },
+    "backend/recovery/STARS_BACKEND_VALIDATION.txt": {
+      "bytes": 6134,
+      "sha256": "58a4057c30aa67919992cc920ffe10477fd62f15c4bfbe2725f056cc4c794498"
+    },
+    "frontend/index.html": {
+      "bytes": 223803,
+      "sha256": "ad19751efa4fb979fb5a9ec53fa47bbfdd62dbae979520810821318387004b9e"
+    },
+    "frontend/recovery/check-stars-shop.cjs": {
+      "bytes": 5643,
+      "sha256": "8b5afc83570945b124967823dabe66980d55f73fb0384f3b8a13b7abc2798f81"
+    },
+    "frontend/recovery/check-rapid-taps.cjs": {
+      "bytes": 8100,
+      "sha256": "80de1649eb95bbaee3231622e7a8003c2c85a353009660bdb8a1ddc9269c0196"
+    },
+    "frontend/recovery/check-daily.cjs": {
+      "bytes": 2672,
+      "sha256": "0aca536b2314b89272b89a882e9c4a544f44dd71353adeb7825a7901dbe50269"
+    },
+    "frontend/recovery/STARS_FRONTEND_VALIDATION.txt": {
+      "bytes": 2737,
+      "sha256": "ed3c32ccaf25dd1a20269ad72094d638e0402cefc0dc6a14fc81d4982fe190fc"
+    }
+  }
+}

@@ -15,6 +15,7 @@ const { loadConfig } = require("./lib/config");
 const { createMonetagRewards } = require("./lib/monetagRewards");
 const { createGameplay } = require("./lib/gameplay");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
+const { createStarsShop, telegramClient } = require("./lib/starsShop");
 const crypto = require("crypto");
 const Stripe = require("stripe");
 const fetch = require("node-fetch");
@@ -551,6 +552,8 @@ const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, g
   packetMax: TAP_PACKET_MAX, vipDailyCap: VIP_DAILY_TAP_CAP });
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
+const starsShop = createStarsShop({pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
+
 app.use(cors());
 // Capture raw body for Stripe webhook signature verification (without breaking JSON parsing)
 app.use(
@@ -567,6 +570,15 @@ app.use(express.urlencoded({ extended: false }));
 // Authenticated provider receipts must survive app maintenance/rate limits.
 // This route only persists confirmation; it never grants a reward.
 app.get("/postback/monetag", monetagRewards.handler(req => monetagRewards.postback(req.query)));
+
+// Payment confirmations stay available during maintenance and after sales are paused.
+app.post("/telegram/stars-webhook", starsShop.webhook, async (req,res) => {
+  // Enabling receipt delivery must not reopen registration during maintenance.
+  if (MAINTENANCE_MODE && !(String(process.env.RECOVERY_TEST_ENABLED) === "1" &&
+      String(req.body?.message?.from?.id) === String(process.env.RECOVERY_TEST_TELEGRAM_ID))) return res.json({ok:true});
+  try { await bot.handleUpdate(req.body); return res.json({ok:true}); }
+  catch (_) { return res.status(503).json({ok:false}); }
+});
 
 // ------------ Public stats (for Early Access announcements) ------------
 // Used by the frontend to show a blocking welcome announcement until the first 1,000 users.
@@ -622,7 +634,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {

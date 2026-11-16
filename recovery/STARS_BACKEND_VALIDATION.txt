@@ -1,0 +1,78 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> airdrop-empire-bot@1.0.0 test
+> node --test test/*.test.js
+
+✔ verified owner daily claim credits server reward once and preserves tester flags (84.658721ms)
+✔ missed day supports start-new then credits only today (20.945003ms)
+✔ completed idempotency receipt cannot grant or announce another reward (13.288836ms)
+✔ wrong and forged identities and unknown actions stay blocked (25.796256ms)
+⚠ DATABASE_URL is not set when loading lib/db.js
+﹣ only server-owned placements can create attempts; no secret is exposed (1.041052ms) # SKIP
+﹣ maintenance test HTTP flow credits one verified quest once, with public rewards still off (0.198096ms) # SKIP
+﹣ bad/missing secrets, wrong zone, wrong owner and malformed macros cannot confirm (0.185137ms) # SKIP
+﹣ non-valued events persist but cannot unlock Claim; valued upgrade can (0.175752ms) # SKIP
+﹣ parallel callbacks and claims credit exactly once and persist a real 24-hour cooldown (0.202723ms) # SKIP
+﹣ a different user cannot claim an eligible attempt (0.170173ms) # SKIP
+﹣ failed postback persistence does not acknowledge success or leave a claimable reward (0.222832ms) # SKIP
+﹣ a transaction failure rolls back the ledger, balance and cooldown; retry succeeds once (0.220629ms) # SKIP
+﹣ legacy claim dates survive cutover, but legacy timer starts never become claimable (0.274449ms) # SKIP
+﹣ no-fill retry uses a new ymid; multiple eligible attempts cannot be banked across cycles (0.253078ms) # SKIP
+﹣ delayed confirmation survives restart and kill switch; expired attempts do not unlock (0.13389ms) # SKIP
+﹣ browser Supabase roles cannot read or write reward receipts (0.121171ms) # SKIP
+﹣ RLS blocks browser access even if schema and table grants are accidentally restored (0.52945ms) # SKIP
+﹣ all seven placements fulfill exactly once; boost receipts never add coin ledger entries (0.232006ms) # SKIP
+﹣ boost rollback does not consume its receipt or apply a partial boost (0.145437ms) # SKIP
+﹣ tap failure retries safely, concurrent packets cannot spend the same energy, and expired x2 is ignored (0.123564ms) # SKIP
+﹣ full energy and an active double boost do not start unnecessary ads (0.117556ms) # SKIP
+✔ maintenance blocks app, checkout, payout and callback handlers before they execute (58.91361ms)
+✔ maintenance keeps health and season status available (24.767593ms)
+✔ normal mode allows the configuration handler and does not grow middleware (7.333726ms)
+✔ new reward routes require Telegram authentication and legacy ad bypasses stay closed (27.993003ms)
+✔ Monetag receiver stays reachable during app maintenance but requires its private configuration (10.405276ms)
+✔ recovery access requires its explicit switch, a valid numeric ID, and maintenance (52.672765ms)
+✔ forged, wrong-account, expired, future and duplicate Telegram data cannot enter recovery (17.306517ms)
+✔ authorized recovery state and mission listing are read-only with public rewards disabled (10.659816ms)
+✔ recovery does not create missing accounts or permit system accounts (19.0316ms)
+✔ even the tester cannot access payments, withdrawals, legacy taps, admin or legacy ads (32.447035ms)
+Monetag operation failed { code: '08006' }
+sync_user: balance matches ledger { user_id: 23 }
+sync_user: balance matches ledger { user_id: 23 }
+sync_user: balance matches ledger { user_id: 23 }
+✔ recovery database failures return a sanitized error instead of secret-bearing details (9.760485ms)
+✔ an unimplemented payout provider never returns a success identifier (3.168174ms)
+✔ a payout job cannot mark a withdrawal paid when no provider is configured (0.810449ms)
+✔ sync_user preserves disputed balances until reconciliation is reviewed (0.526916ms)
+✔ sync_user accepts matching bigint balances without writing them (0.406887ms)
+✔ tester catalog is read-only, strips checkout URLs and keeps purchases blocked (10.145519ms)
+⚠ DATABASE_URL is not set when loading lib/db.js
+✔ preview has three packs and starter, no rolling offer timer until sales enabled (1414.804752ms)
+✔ catalogue offer deadline is persistent across visits; expiry never resets (16.371022ms)
+✔ server prices and quantities form an XTR invoice; retry reuses order (27.151869ms)
+✔ wrong buyer, price, currency and expired invoice fail precheckout (14.30447ms)
+✔ precheckout approves once; same query retries but different query cannot charge twice (18.364721ms)
+✔ duplicate successful receipts credit exactly once and survive disabled sales (24.173438ms)
+✔ parallel receipt delivery is serialized and does not double credit (19.055055ms)
+✔ ledger failure rolls back balance, receipt state and ledger; retry succeeds (24.491922ms)
+✔ unapproved or mismatched successful payment cannot grant coins (19.035155ms)
+✔ charge id cannot be reused on another order; transaction rolls back (24.977016ms)
+✔ starter can be purchased once and cannot be repurchased after refund (26.036996ms)
+✔ refund is recorded and reversed once, late successful receipt does not re-credit (32.232059ms)
+✔ refund before success prevents later fulfilment (33.102417ms)
+✔ spent refund leaves an explicit reconciliation amount, never negative balance (21.253553ms)
+✔ wrong user cannot read order or create invoice (12.426711ms)
+✔ webhook rejects missing, wrong and unicode secrets before handling a receipt (3.892214ms)
+✔ webhook lookup network failure cannot open checkout or credit (14.217632ms)
+✔ lost invoice creation response is recoverable without duplicate orders or coins (14.420364ms)
+✔ shop visitor measurement counts one viewer per UTC day and excludes preview (16.35623ms)
+✔ paused product rejects checkout without balance changes (19.028726ms)
+✔ client database roles cannot access payment records (11.848388ms)
+✔ real HTTP routes keep Stars owner-only and accept authenticated receipts during maintenance (121.960217ms)
+ℹ tests 59
+ℹ suites 0
+ℹ pass 42
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 17
+ℹ todo 0
+ℹ duration_ms 2132.957326
