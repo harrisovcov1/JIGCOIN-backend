@@ -280,7 +280,6 @@ const DAILY_CHECKIN_REWARD = 500;
 // VIP (points-based purchase in this build; swap to payments later)
 const VIP_MONTH_COST = 5000;
 const VIP_MAX_ENERGY = 75;
-const VIP_DAILY_TAP_CAP = 8000;
 
 // Referral ladder (server-side tiers)
 function getReferralTier(count) {
@@ -549,7 +548,7 @@ const app = express();
 const getEnergyCap = user => getEffectiveMaxEnergy(user, getStreakMetaFromUser(user));
 const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
   getMultiplier: user => Number(getStreakMetaFromUser(user)?.tap_multiplier || 1),
-  packetMax: TAP_PACKET_MAX, vipDailyCap: VIP_DAILY_TAP_CAP });
+  packetMax: TAP_PACKET_MAX });
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
 const starsShop = createStarsShop({pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
@@ -2410,8 +2409,6 @@ async function handleTap(user) {
     user = await ensureDailyReset(user);
   }
 
-  if (user.taps_today >= 5000) return user;
-
   let perTap = 1;
 
   if (
@@ -3229,14 +3226,8 @@ app.post("/api/tap", async (req, res) => {
       return res.json({ ...state, ok: false, reason: "NO_ENERGY" });
     }
 
-    // 4) Daily tap cap
-    const vipActive = user.vip_until && new Date(user.vip_until) > new Date();
-    const maxTapsPerDay = vipActive ? VIP_DAILY_TAP_CAP : 5000;
+    // Daily tap counts track activity without imposing an earning cap.
     const currentTaps = Number(user.taps_today || 0);
-    if (currentTaps >= maxTapsPerDay) {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "MAX_TAPS_REACHED" });
-    }
 
     // 5) Spend 1 energy + add points (double if boost still active)
     const basePerTap = 1;
@@ -3708,7 +3699,8 @@ app.post("/api/vip/status", async (req, res) => {
         vip_until: vipUntilIso,
         perks: {
           max_energy: active ? VIP_MAX_ENERGY : Number(user.max_energy || 50),
-          daily_tap_cap: active ? VIP_DAILY_TAP_CAP : 5000,
+          daily_tap_cap: null,
+          daily_taps_unlimited: true,
         },
       },
     });
