@@ -3,8 +3,10 @@
 const {pool,withTransaction}=require('../lib/db');
 const {applyBalanceChangeTx}=require('../lib/ledger');
 const {createStarsShop,telegramClient}=require('../lib/starsShop');
+const {createStreakRestore}=require('../lib/streakRestore');
 const env=process.env,callTelegram=telegramClient(env);
 const shop=createStarsShop({pool,withTransaction,applyBalanceChangeTx,env,callTelegram});
+const restore=createStreakRestore({pool,withTransaction,env,callTelegram});
 async function main(){
  const [command,payload,confirm]=process.argv.slice(2);
  if(command==='status'){
@@ -27,7 +29,7 @@ async function main(){
   console.log('Webhook configured and verified. Sales flag was not changed.');return;
  }
  if(command==='refund' && confirm==='--confirm-refund'){
-  console.log(JSON.stringify(await shop.refundOrder(payload)));return;
+  console.log(JSON.stringify(await (restore.matches(payload)?restore:shop).refundOrder(payload)));return;
  }
  throw Error('Usage: node scripts/stars-admin.cjs status | configure-webhook | refund ORDER_REFERENCE --confirm-refund');
 }

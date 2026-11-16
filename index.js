@@ -14,6 +14,8 @@ const powerups = require("./lib/powerups");
 const { loadConfig } = require("./lib/config");
 const { createMonetagRewards } = require("./lib/monetagRewards");
 const { createProgression } = require("./lib/progression");
+const {dailyReward,restorePolicy} = require("./lib/streakPolicy");
+const {createStreakRestore} = require("./lib/streakRestore");
 const { createStreakRewards } = require("./lib/streakRewards");
 const { createGameplay } = require("./lib/gameplay");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
@@ -404,15 +406,12 @@ function getStreakMetaFromUser(user) {
   }
   const lastCheckinDay = lastCheckinAt ? utcDayString(lastCheckinAt) : null;
 
-  const brokenAt = user.streak_broken_at ? new Date(user.streak_broken_at) : null;
-  const broken = brokenAt && !isNaN(brokenAt);
-  const restoreWindowMs = STREAK_RESTORE_WINDOW_HOURS * 60 * 60 * 1000;
-
-  const restoreEndsAt = broken ? new Date(brokenAt.getTime() + restoreWindowMs) : null;
-  const restoreAvailable = broken && restoreEndsAt && restoreEndsAt > now;
-
-  // If broken and restore window expired, treat as permanently lost.
-  const permanentlyLost = broken && (!restoreEndsAt || restoreEndsAt <= now);
+  const policy=restorePolicy(user,now);
+  const brokenAt=policy.broken_at?new Date(policy.broken_at):null;
+  const broken=policy.broken;
+  const restoreEndsAt=policy.expires_at?new Date(policy.expires_at):null;
+  const restoreAvailable=policy.eligible;
+  const permanentlyLost=broken&&!restoreAvailable;
 
   // Streak benefits require a current or previous UTC-day check-in.
   const checkinGap = lastCheckinDay ? diffUtcDays(lastCheckinDay, utcDayString(now)) : null;
@@ -554,9 +553,10 @@ const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, g
   packetMax: TAP_PACKET_MAX });
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
-const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS});
+const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
+const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS,restoreEnabled:streakRestore.enabled});
 const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS,streakRewards});
-const starsShop = createStarsShop({pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
+const starsShop = createStarsShop({streakRestore,pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
 
 app.use(cors());
 // Capture raw body for Stripe webhook signature verification (without breaking JSON parsing)
@@ -638,7 +638,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, progression, streakRewards }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -1123,6 +1123,7 @@ app.post("/api/payments/create-checkout", async (req, res) => {
       return res.status(400).json({ ok: false, error: "BAD_PROVIDER" });
     }
 
+    if(String(sku).startsWith("STREAK_RESTORE_"))return res.status(409).json({ok:false,error:"USE_STARS_RESTORE"});
     const rows = await getActivePaymentProductBySku(sku);
     if (!rows.length) return res.status(404).json({ ok: false, error: "PRODUCT_NOT_FOUND" });
 
@@ -2553,11 +2554,11 @@ async function buildClientState(user, { readOnly = false } = {}) {
 
     if (!readOnly && shouldBreak && !hasMomentumShield) {
       await pool.query(
-        `update public.users set streak_broken_at = now() where id = $1 and streak_broken_at is null`,
-        [user.id]
+        `update public.users set streak_broken_at = $2 where id = $1 and streak_broken_at is null`,
+        [user.id, restorePolicy(user).broken_at]
       );
-      // keep local copy consistent for this response
-      user.streak_broken_at = new Date().toISOString();
+      // A fixed UTC boundary, never a fresh countdown on returning.
+      user.streak_broken_at = restorePolicy(user).broken_at;
     }
   } catch (e) {
     // never fail /api/state because of streak break detection
@@ -4568,228 +4569,56 @@ async function handleDailyCheckin(req, res, verifiedTester = null) {
 
     const action = String(req.body.action || "").trim().toLowerCase(); // "", "start_new"
 
-    // Compute current streak meta from user row
-    let meta = getStreakMetaFromUser(user);
-
-    // If a broken streak has expired, clear it (permanently lost)
-    if (meta.permanently_lost) {
-      try {
-        const cleared = await pool.query(
-          `
-          UPDATE public.users
-          SET streak_broken_at = NULL,
-              streak_count = 0
-          WHERE id = $1
-          RETURNING *;
-          `,
-          [user.id]
-        );
-        if (cleared.rows && cleared.rows[0]) {
-          user = cleared.rows[0];
-          meta = getStreakMetaFromUser(user);
-        }
-      } catch (e) {}
-    }
-
-    const todayStr = utcDayString(new Date());
-    const lastDay = meta.last_checkin_day;
-
-    // If the user already claimed today, block (true daily)
-    if (lastDay === todayStr) {
-      const nextAt = startOfUtcDay(utcDayString(new Date(Date.now() + 24*60*60*1000))).toISOString();
-      const state = await dailyState(user);
-      return res.json({
-        ...state,
-        ok: false,
-        reason: "ALREADY_CLAIMED",
-        next_claim_at: nextAt,
-      });
-    }
-
-    // If the user currently has a broken streak within the restore window,
-    // do not auto-reset: force a decision (restore paid OR start new streak).
-    if (meta.restore_available && action !== "start_new") {
-      const state = await dailyState(user);
-      return res.json({
-        ...state,
-        ok: false,
-        reason: "STREAK_BROKEN",
-        streak_restore_available: meta.restore_available,
-        error: "Streak is broken. Tap daily check-in to start a new streak, or restore in the shop.",
-        streak_restore_ends_at: meta.restore_ends_at,
-      });
-    }
-
-    // Determine what happens when claiming today's check-in.
-    // - If there was no previous check-in: start at 1.
-    // - If last check-in was yesterday: increment.
-    // - If missed 1+ days: if action=start_new -> start at 1; otherwise mark break + force decision above.
-    let newStreak = 1;
-    let missed = false;
-    let momentumShieldToConsumeId = null;
-
-    if (lastDay) {
-      const diff = diffUtcDays(lastDay, todayStr);
-      if (diff === 1) {
-        newStreak = Math.max(1, Math.floor(Number(user.streak_count || 0))) + 1;
-      } else if (diff > 1) {
-        missed = true;
-        newStreak = 1;
-
-        // Momentum Shield: forgive exactly one missed day (diff==2)
-        if (diff === 2) {
-          try {
-            const { rows: shieldRows } = await pool.query(
-              `
-              SELECT id, quantity
-              FROM public.user_powerups
-              WHERE user_id = $1
-                AND powerup_code = 'MOMENTUM_SHIELD'
-                AND status = 'active'
-                AND (expires_at is null OR expires_at > NOW())
-                AND quantity > 0
-              ORDER BY created_at ASC
-              LIMIT 1;
-              `,
-              [user.id]
-            );
-            if (shieldRows && shieldRows[0]) {
-              // treat as if the user checked in yesterday
-              missed = false;
-              momentumShieldToConsumeId = shieldRows[0].id;
-              newStreak = Math.max(1, Math.floor(Number(user.streak_count || 0))) + 1;
-            }
-          } catch (e) {}
-        }
+    if(!["", "daily_checkin", "start_new"].includes(action))return res.status(400).json({ok:false,reason:"UNKNOWN_ACTION"});
+    let totalReward=0,bonus=0,credited=false,reason=null;
+    // Serialize claims and paid restores on the same user row. Client reward values are ignored.
+    await withTransaction(async client=>{
+      user=(await client.query("SELECT * FROM public.users WHERE id=$1 FOR UPDATE",[user.id])).rows[0];
+      if(!user)throw new Error("ACCOUNT_UNAVAILABLE");
+      const todayStr=utcDayString(new Date()),meta=getStreakMetaFromUser(user);
+      if(meta.last_checkin_day===todayStr){reason="ALREADY_CLAIMED";return;}
+      const policy=restorePolicy(user),gap=policy.gap;
+      if(gap!==null&&gap<0)throw new Error("CHECKIN_DATE_INVALID");
+      let newStreak=gap===1?Math.max(0,Number(user.streak_count)||0)+1:1;
+      let shield=null;
+      if(gap===2){
+        shield=(await client.query(`SELECT id,quantity FROM public.user_powerups WHERE user_id=$1
+          AND powerup_code='MOMENTUM_SHIELD' AND status='active'
+          AND (expires_at IS NULL OR expires_at>NOW()) AND quantity>0
+          ORDER BY created_at ASC LIMIT 1 FOR UPDATE`,[user.id])).rows[0];
+        if(shield)newStreak=Number(user.streak_count)+1;
       }
-    }
-
-    // If missed and not already marked broken, mark break (starts restore window).
-    if (missed && !meta.broken_at) {
-      try {
-        const brokenRes = await pool.query(
-          `
-          UPDATE public.users
-          SET streak_broken_at = NOW()
-          WHERE id = $1
-          RETURNING *;
-          `,
-          [user.id]
-        );
-        if (brokenRes.rows && brokenRes.rows[0]) {
-          user = brokenRes.rows[0];
-          meta = getStreakMetaFromUser(user);
-        }
-
-        // Audit event
-        try {
-          await pool.query(
-            `INSERT INTO public.streak_events (user_id, telegram_id, event, meta) VALUES ($1, $2, 'break', $3::jsonb);`,
-            [user.id, user.telegram_id, JSON.stringify({ prior_streak: Number(user.streak_count || 0), broke_on: todayStr })]
-          );
-        } catch (e) {}
-
-      } catch (e) {}
-    }
-
-    // If missed and action is not start_new, force decision (restore OR start new).
-    if (missed && action !== "start_new") {
-      const state = await dailyState(user);
-      return res.json({
-        ...state,
-        ok: false,
-        reason: "STREAK_BROKEN",
-        streak_restore_available: meta.restore_available,
-        error: "Streak is broken. Tap daily check-in to start a new streak, or restore in the shop.",
-        streak_restore_ends_at: meta.restore_ends_at,
-      });
-    }
-
-    // Claim today's daily reward (idempotent per UTC day)
-    const endpoint = "/api/task/daily";
-    const context = "daily";
-    const requestId = `${user.id}:${todayStr}`;
-
-    // Reward: base + milestone bonus (milestones based on the NEW streak)
-    let bonus = 0;
-    for (const m of STREAK_BONUS) {
-      if (newStreak === m.days) bonus += m.bonus;
-    }
-    const totalReward = DAILY_CHECKIN_REWARD + bonus;
-
-    let credited = false;
-    await withTransaction(async (client) => {
-      const idemRow = await ensureIdempotencyKeyTx(client, {
-        userId: user.id,
-        endpoint,
-        requestId,
-        context,
-      });
-
-      if (idemRow.status === "completed") {
-        return;
+      if(policy.broken&&!shield&&action!=="start_new"){
+        await client.query("UPDATE public.users SET streak_broken_at=$2 WHERE id=$1",[user.id,policy.broken_at]);
+        reason="STREAK_BROKEN";return;
       }
-
-      await applyBalanceChangeTx(client, {
-        userId: user.id,
-        delta: totalReward,
-        reason: "daily_bonus",
-        refType: "daily",
-        refId: null,
-        eventType: "bonus",
-      });
-
-      // If a Momentum Shield was used to forgive a missed day, consume 1 unit now.
-      if (momentumShieldToConsumeId) {
-        try {
-          await powerups.consumePowerupUnitById(client, momentumShieldToConsumeId);
-          await client.query(
-            `INSERT INTO public.streak_events (user_id, telegram_id, event, meta)
-             VALUES ($1, $2, 'momentum_shield_used', $3::jsonb);`,
-            [user.id, user.telegram_id, JSON.stringify({ on_day: todayStr, new_streak: newStreak })]
-          );
-        } catch (e) {}
-      }
-
-      // If user chose to start a new streak after break, clear broken_at
-      const clearBrokenAt = missed || meta.restore_available;
-
-      await client.query(
-        `
-        UPDATE public.users
-        SET streak_count = $1,
-            last_checkin_at = NOW(),
-            last_daily = $2,
-            last_checkin_date = $2,
-            streak_broken_at = CASE WHEN $3 THEN NULL ELSE streak_broken_at END
-        WHERE id = $4;
-        `,
-        [newStreak, todayStr, clearBrokenAt, user.id]
-      );
-
+      const endpoint="/api/task/daily",context="daily",requestId=`${user.id}:${todayStr}`;
+      const idem=await ensureIdempotencyKeyTx(client,{userId:user.id,endpoint,context,requestId});
+      if(idem.status==="completed")return;
+      totalReward=dailyReward(newStreak,STREAK_BONUS);
+      bonus=STREAK_BONUS.filter(m=>m.days===newStreak).reduce((n,m)=>n+m.bonus,0);
+      await applyBalanceChangeTx(client,{userId:user.id,delta:totalReward,reason:"daily_bonus",refType:"daily",refId:null,eventType:"bonus"});
+      if(shield)await powerups.consumePowerupUnitById(client,shield.id);
+      await client.query(`UPDATE public.users SET streak_count = $1,last_checkin_at=NOW(),
+        last_daily=$2,last_checkin_date=$2,streak_broken_at=CASE WHEN $3 THEN NULL ELSE streak_broken_at END
+        WHERE id=$4`,[newStreak,todayStr,true,user.id]);
       await streakRewards.grant(client,user.id,newStreak);
-
-      // Audit event
-      try {
-        await client.query(
-          `INSERT INTO public.streak_events (user_id, telegram_id, event, meta) VALUES ($1, $2, 'checkin', $3::jsonb);`,
-          [user.id, user.telegram_id, JSON.stringify({ streak: newStreak, bonus })]
-        );
-      } catch (e) {}
-
-      credited = true;
-      await completeIdempotencyKeyTx(client, {
-        endpoint,
-        requestId,
-        context,
-        responsePayload: null,
-      });
+      await client.query(`INSERT INTO public.streak_events(user_id,telegram_id,event,meta)
+        VALUES($1,$2,'checkin',$3::jsonb)`,[user.id,user.telegram_id,JSON.stringify({streak:newStreak,bonus,shield_used:!!shield})]);
+      await completeIdempotencyKeyTx(client,{endpoint,requestId,context,responsePayload:null});
+      credited=true;
     });
+    if(reason){
+      user=(await pool.query("SELECT * FROM public.users WHERE id=$1",[user.id])).rows[0];
+      const meta=getStreakMetaFromUser(user);
+      return res.json({...await dailyState(user),ok:false,reason,
+        streak_restore_available:meta.restore_available,streak_restore_ends_at:meta.restore_ends_at});
+    }
 
     // Reload user
     const upd = await pool.query(`SELECT * FROM public.users WHERE id = $1`, [user.id]);
     user = upd.rows[0];
-    meta = getStreakMetaFromUser(user);
+    const meta = getStreakMetaFromUser(user);
 
     // Starter Bundle onboarding: start a 7-day window the first time a user successfully claims the daily bonus.
     if (!user.starter_offer_purchased && !user.starter_offer_expires_at) {
@@ -4825,58 +4654,9 @@ async function handleDailyCheckin(req, res, verifiedTester = null) {
 }
 
 
-// Streak restore checkout (paid card/crypto only; 36h window)
-app.post("/api/streak/restore/create-checkout", async (req, res) => {
-  try {
-    const user = await getOrCreateUserFromInitData(req);
-    const meta = getStreakMetaFromUser(user);
-
-    if (!meta.restore_available) {
-      return res.status(400).json({ ok: false, error: "RESTORE_NOT_AVAILABLE" });
-    }
-
-    const sku = meta.restore_pack_sku;
-    const restoreTier = meta.restore_tier;
-    if (!sku) {
-      return res.status(400).json({ ok: false, error: "NO_RESTORE_SKU" });
-    }
-
-    const r = await pool.query(
-      `
-      SELECT provider, pack_sku, currency, amount_minor, checkout_url
-      FROM public.payment_products
-      WHERE pack_sku = $1
-      LIMIT 50;
-      `,
-      [sku]
-    );
-
-    const rows = r.rows || [];
-    const coinbaseProduct = rows.find((x) => String(x.provider || "").toLowerCase() === "coinbase");
-    const stripeProduct = rows.find((x) => String(x.provider || "").toLowerCase() === "stripe");
-
-    if ((!coinbaseProduct || !coinbaseProduct.checkout_url) && (!stripeProduct || !stripeProduct.checkout_url)) {
-      return res.status(404).json({ ok: false, error: "RESTORE_PRODUCT_MISSING", sku });
-    }
-
-    // Reuse the existing unified checkout endpoint for Stripe session creation when possible.
-    // The frontend may open either link; Stripe requires a session URL, Coinbase uses checkout_url directly.
-    // We return both.
-    return res.json({
-      ok: true,
-      sku,
-      restore_tier: restoreTier,
-      restore_ends_at: meta.restore_ends_at,
-      coinbaseCheckoutUrl: coinbaseProduct ? coinbaseProduct.checkout_url : null,
-      stripeCheckoutUrl: stripeProduct ? stripeProduct.checkout_url : null,
-    });
-  } catch (err) {
-    console.error("Error /api/streak/restore/create-checkout:", err);
-    res.status(500).json({ ok: false, error: "RESTORE_CHECKOUT_ERROR" });
-  }
-});
-
-
+// New restore purchases use Telegram Stars. Legacy provider receipts remain settleable.
+app.post("/api/streak/restore/create-checkout", starsShop.handler(async req=>streakRestore.invoice(await getOrCreateUserFromInitData(req))));
+app.post("/api/streak/restore/status", starsShop.handler(async req=>streakRestore.status(await getOrCreateUserFromInitData(req),req.body.order_id)));
 
 // Friends summary
 // Friends summary (kept for existing front-end)
