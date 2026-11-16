@@ -13,6 +13,7 @@ const { ensureIdempotencyKeyTx, completeIdempotencyKeyTx } = require("./lib/idem
 const powerups = require("./lib/powerups");
 const { loadConfig } = require("./lib/config");
 const { createMonetagRewards } = require("./lib/monetagRewards");
+const { createProgression } = require("./lib/progression");
 const { createGameplay } = require("./lib/gameplay");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
@@ -551,6 +552,7 @@ const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, g
   packetMax: TAP_PACKET_MAX });
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
+const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS});
 const starsShop = createStarsShop({pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
 
 app.use(cors());
@@ -633,7 +635,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, progression }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -656,6 +658,10 @@ app.use((req, res, next) => {
   });
 });
 
+
+// Authenticated, server-counted challenges. The maintenance guard above applies.
+app.post('/api/progression',monetagRewards.handler(async req=>progression.status(await getOrCreateUserFromInitData(req))));
+app.post('/api/progression/claim',monetagRewards.handler(async req=>progression.claim(await getOrCreateUserFromInitData(req),req.body)));
 
 // Verified rewarded quests supersede the legacy timer-only handlers below.
 for (const action of ["start", "complete"]) {
