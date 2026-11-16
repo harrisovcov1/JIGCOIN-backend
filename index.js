@@ -622,7 +622,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -4528,9 +4528,14 @@ app.post("/api/boost/completeAd", async (req, res) => {
 
 
 // Daily task route – DAILY CHECK-IN (UTC day, streak break + restore flow)
-app.post("/api/task", async (req, res) => {
+app.post("/api/task", (req, res) => handleDailyCheckin(req, res));
+async function handleDailyCheckin(req, res, verifiedTester = null) {
+  const dailyState = async user => ({
+    ...await buildClientState(user, verifiedTester ? {readOnly:true} : undefined),
+    ...(verifiedTester ? {onboarding_required:false,recovery_test:true,recovery_gameplay:true} : {})
+  });
   try {
-    let user = await getOrCreateUserFromInitData(req);
+    let user = verifiedTester || await getOrCreateUserFromInitData(req);
 
     const taskNameRaw = req.body.taskName || "";
     const taskName = String(taskNameRaw).trim().toLowerCase();
@@ -4579,7 +4584,7 @@ app.post("/api/task", async (req, res) => {
     // If the user already claimed today, block (true daily)
     if (lastDay === todayStr) {
       const nextAt = startOfUtcDay(utcDayString(new Date(Date.now() + 24*60*60*1000))).toISOString();
-      const state = await buildClientState(user);
+      const state = await dailyState(user);
       return res.json({
         ...state,
         ok: false,
@@ -4591,7 +4596,7 @@ app.post("/api/task", async (req, res) => {
     // If the user currently has a broken streak within the restore window,
     // do not auto-reset: force a decision (restore paid OR start new streak).
     if (meta.restore_available && action !== "start_new") {
-      const state = await buildClientState(user);
+      const state = await dailyState(user);
       return res.json({
         ...state,
         ok: false,
@@ -4676,7 +4681,7 @@ app.post("/api/task", async (req, res) => {
 
     // If missed and action is not start_new, force decision (restore OR start new).
     if (missed && action !== "start_new") {
-      const state = await buildClientState(user);
+      const state = await dailyState(user);
       return res.json({
         ...state,
         ok: false,
@@ -4699,6 +4704,7 @@ app.post("/api/task", async (req, res) => {
     }
     const totalReward = DAILY_CHECKIN_REWARD + bonus;
 
+    let credited = false;
     await withTransaction(async (client) => {
       const idemRow = await ensureIdempotencyKeyTx(client, {
         userId: user.id,
@@ -4756,6 +4762,7 @@ app.post("/api/task", async (req, res) => {
         );
       } catch (e) {}
 
+      credited = true;
       await completeIdempotencyKeyTx(client, {
         endpoint,
         requestId,
@@ -4784,14 +4791,15 @@ app.post("/api/task", async (req, res) => {
     }
 
     const nextAt = startOfUtcDay(utcDayString(new Date(Date.now() + 24*60*60*1000))).toISOString();
-    const state = await buildClientState(user);
+    const state = await dailyState(user);
 
     return res.json({
       ...state,
       ok: true,
-      reward: totalReward,
+      reward: credited ? totalReward : 0,
+      already_claimed: !credited,
       streak: Number(user.streak_count || 0),
-      bonus,
+      bonus: credited ? bonus : 0,
       message: "🔥 Daily check-in claimed!",
       next_claim_at: nextAt,
     });
@@ -4799,7 +4807,7 @@ app.post("/api/task", async (req, res) => {
     console.error("Error /api/task:", err);
     res.status(500).json({ ok: false, error: "TASK_ERROR" });
   }
-});
+}
 
 
 // Streak restore checkout (paid card/crypto only; 36h window)
