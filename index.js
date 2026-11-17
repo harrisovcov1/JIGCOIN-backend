@@ -19,6 +19,7 @@ const {createStreakRestore} = require("./lib/streakRestore");
 const { createStreakRewards } = require("./lib/streakRewards");
 const { createGameplay } = require("./lib/gameplay");
 const { createInvite } = require("./lib/invite");
+const { createReferralCredit } = require("./lib/referralCredit");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
 const crypto = require("crypto");
@@ -548,6 +549,8 @@ const getEnergyCap = user => getEffectiveMaxEnergy(user, getStreakMetaFromUser(u
 const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
   getMultiplier: user => { const meta=getStreakMetaFromUser(user); return meta.active ? Number(meta.tap_multiplier || 1) : 1; },
   packetMax: TAP_PACKET_MAX });
+const referralCredit = createReferralCredit({pool,withTransaction,getReferralTier,baseReward:REFERRAL_REWARD,
+  strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const invite = createInvite({pool,getReferralTier,baseReward:REFERRAL_REWARD,botUsername:BOT_USERNAME,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
@@ -637,7 +640,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -676,7 +679,9 @@ for (const action of ["start", "complete"]) {
     return monetagRewards.handler(async () => {
       const user = await getOrCreateUserFromInitData(req);
       if (action === "start") return monetagRewards.start(user, code);
-      return monetagRewards.claim(user, code, req.body.attempt_id);
+      const reward = await monetagRewards.claim(user, code, req.body.attempt_id);
+      await referralCredit.settle(user);
+      return reward;
     })(req, res);
   });
 }
@@ -1709,10 +1714,11 @@ function buildDataCheckString(initDataRaw) {
 
 function verifyTelegramInitData(initDataRaw, botToken) {
   try {
-    if (!initDataRaw || !botToken) return { ok: false, error: "missing_initdata_or_token" };
+    if (typeof initDataRaw !== "string" || !initDataRaw || initDataRaw.length>16384 || !botToken) return { ok: false, error: "missing_initdata_or_token" };
     const params = new URLSearchParams(initDataRaw);
+    if (new Set(params.keys()).size !== [...params.keys()].length) return {ok:false,error:"duplicate_initdata_field"};
     const hash = params.get("hash");
-    if (!hash) return { ok: false, error: "missing_hash" };
+    if (!/^[0-9a-f]{64}$/.test(hash || "")) return { ok: false, error: "missing_hash" };
 
     const dataCheckString = buildDataCheckString(initDataRaw);
     const secretKey = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
@@ -1725,7 +1731,7 @@ function verifyTelegramInitData(initDataRaw, botToken) {
     const authDate = Number(params.get("auth_date") || 0);
     const maxAgeSec = Number(process.env.TG_INITDATA_MAX_AGE_SEC || 86400);
     const nowSec = Math.floor(Date.now() / 1000);
-    if (!authDate || nowSec - authDate > maxAgeSec) return { ok: false, error: "stale_auth_date" };
+    if (!Number.isSafeInteger(authDate) || authDate<=0 || !Number.isFinite(maxAgeSec) || maxAgeSec<=0 || authDate>nowSec+30 || nowSec - authDate > maxAgeSec) return { ok: false, error: "stale_auth_date" };
 
     return { ok: true };
   } catch (e) {
@@ -2082,48 +2088,11 @@ async function getOrCreateUserFromInitData(req) {
   }
 
   const data = parseInitData(initDataRaw);
-
-  let telegramUserId = null;
-  let username = null;
-  let firstName = null;
-
-  if (data.user) {
-    try {
-      const u = typeof data.user === "string" ? JSON.parse(data.user) : data.user;
-      telegramUserId = u.id;
-      username = u.username || null;
-      firstName = u.first_name || null;
-    } catch (e) {
-      console.error("Error parsing user from initData:", e);
-    }
-  }
-
-  if (!telegramUserId) {
-    const e = new Error("missing_telegram_user");
-    e.status = 401;
-    throw e;
-  }
-
-  const { rows: existing } = await pool.query(
-    `select * from public.users where telegram_id = $1::bigint limit 1`,
-    [telegramUserId],
-  );
-
-  let user = existing[0];
-  if (!user) {
-    const { rows: created } = await pool.query(
-      `insert into public.users (telegram_id, username, first_name, created_at)
-       values ($1::bigint, $2, $3, now())
-       ON CONFLICT (telegram_id) DO NOTHING
-       returning *`,
-      [telegramUserId, username, firstName],
-    );
-    // AFTER INSERT bonus triggers can change balance after RETURNING was formed.
-    // Re-read committed state, also handling simultaneous first-open requests.
-    user = (await pool.query("SELECT * FROM public.users WHERE telegram_id=$1::bigint", [telegramUserId])).rows[0];
-  }
-
-  return user;
+  let telegramUser;
+  try { telegramUser = JSON.parse(data.user); }
+  catch (_) { throw Object.assign(new Error("missing_telegram_user"), {status:401}); }
+  const user = await referralCredit.register(telegramUser, data.start_param);
+  return referralCredit.settle(user);
 }
 
 
@@ -2217,91 +2186,9 @@ async function logEvent(userId, event, meta = null) {
   } catch (e) {}
 }
 
-async function hasReferralReward(inviterTelegramId, invitedTelegramId) {
-  try {
-    const q = await pool.query(
-      `SELECT 1 FROM public.sponsor_ledger
-       WHERE event='referral_reward'
-         AND meta->>'inviter_id' = $1
-         AND meta->>'invited_id' = $2
-       LIMIT 1;`,
-      [String(inviterTelegramId), String(invitedTelegramId)]
-    );
-    return q.rows.length > 0;
-  } catch (e) {
-    return false;
-  }
-}
-
-async function recordReferralReward(inviterUserId, inviterTelegramId, invitedTelegramId, amount, reason) {
-  try {
-    await pool.query(
-      `INSERT INTO public.sponsor_ledger (campaign_id, user_id, mission_id, event, amount, meta)
-       VALUES (NULL, $1, NULL, 'referral_reward', $2, $3::jsonb)`,
-      [inviterUserId, Number(amount || 0), JSON.stringify({ inviter_id: String(inviterTelegramId), invited_id: String(invitedTelegramId), reason })]
-    );
-  } catch (e) {}
-}
-
-async function maybeActivateReferral(invitedUser, trigger = 'tap') {
-  if (!STRICT_REFERRAL_ACTIVATION) return;
-  try {
-    const invitedTelegramId = Number(invitedUser.telegram_id);
-    if (!invitedTelegramId) return;
-
-    const ref = await pool.query(
-      `SELECT inviter_id FROM public.referrals WHERE invited_id = $1 LIMIT 1;`,
-      [invitedTelegramId]
-    );
-    if (!ref.rows.length) return;
-
-    const inviterTelegramId = Number(ref.rows[0].inviter_id);
-    if (!inviterTelegramId || inviterTelegramId == invitedTelegramId) return;
-
-    if (await hasReferralReward(inviterTelegramId, invitedTelegramId)) return;
-
-    const tapsToday = Number(invitedUser.taps_today || 0);
-    const sponsorDone = trigger === 'sponsor';
-    if (tapsToday < REFERRAL_ACTIVATION_MIN_TAPS && !sponsorDone) return;
-
-    const inviterRes = await pool.query(
-      `SELECT id, referrals_count FROM public.users WHERE telegram_id=$1 LIMIT 1;`,
-      [inviterTelegramId]
-    );
-    if (!inviterRes.rows.length) return;
-
-    const inviterUserId = inviterRes.rows[0].id;
-    const tierInfo = getReferralTier(inviterRes.rows[0].referrals_count);
-    const reward = Math.round(REFERRAL_REWARD * tierInfo.multiplier);
-
-    await withTransaction(async (client) => {
-      // 1) Apply inviter reward via the balance ledger
-      await applyBalanceChangeTx(client, {
-        userId: inviterUserId,
-        delta: reward,
-        reason: "referral_reward",
-        refType: "user",
-        refId: null,
-        eventType: "referral_reward",
-      });
-
-      // 2) Update referral counters atomically with the ledger write
-      await client.query(
-        `
-        UPDATE public.users
-        SET referrals_count = referrals_count + 1,
-            referrals_points = referrals_points + $1
-        WHERE id = $2;
-        `,
-        [reward, inviterUserId]
-      );
-    });
-
-    await recordReferralReward(inviterUserId, inviterTelegramId, invitedTelegramId, reward, trigger);
-    await logEvent(invitedUser.id, 'referral_activated', { inviterTelegramId, reward, trigger });
-  } catch (e) {
-    // never block gameplay
-  }
+async function maybeActivateReferral(invitedUser) {
+  // Legacy call sites also use the canonical database-verified qualification.
+  return referralCredit.settle(invitedUser);
 }
 
 
@@ -3302,8 +3189,8 @@ app.post("/api/tap", async (req, res) => {
       }
       updatedUser = upd.rows[0];
     // Referral activation (anti-fraud): only rewards after real activity
-    maybeActivateReferral(updatedUser, 'tap');
-    const state = await buildClientState(updatedUser);
+    const settledUser = await maybeActivateReferral(updatedUser);
+    const state = await buildClientState(settledUser);
     return res.json({ ...state, ok: true });
   } catch (err) {
     console.error("Error /api/tap:", err);
@@ -3319,7 +3206,7 @@ app.post("/api/tapPacket", monetagRewards.handler(async req => {
   const user = await getOrCreateUserFromInitData(req);
   if (!hit(`tapburst:u:${user.telegram_id}`, 6, 1000)) throw Object.assign(new Error("TAP_RATE_LIMIT"), { code: "TAP_RATE_LIMIT", status: 429 });
   const result = await gameplay.tap(user, req.body);
-  return { ...await buildClientState(result.user), ...result.response };
+  return { ...await buildClientState(await referralCredit.settle(result.user)), ...result.response };
 }));
 
 // Energy boost – refill energy via action or by spending points (hybrid)
@@ -5402,106 +5289,13 @@ app.post("/api/leaderboard/friends", async (req, res) => {
 // /start – handle possible referral
 bot.start(async (ctx) => {
   try {
-    const telegramId = ctx.from.id;
-    const username = ctx.from.username || null;
-    const firstName = ctx.from.first_name || null;
-    const lastName = ctx.from.last_name || null;
-    const languageCode = ctx.from.language_code || null;
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      await ensureSchemaOnce();
-
-      const upsertRes = await client.query(
-        `
-        INSERT INTO public.users (telegram_id, username, first_name, last_name, language_code)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (telegram_id)
-        DO UPDATE SET
-          username = COALESCE(EXCLUDED.username, public.users.username),
-          first_name = COALESCE(EXCLUDED.first_name, public.users.first_name),
-          last_name = COALESCE(EXCLUDED.last_name, public.users.last_name),
-          language_code = COALESCE(EXCLUDED.language_code, public.users.language_code)
-        RETURNING *;
-        `,
-        [telegramId, username, firstName, lastName, languageCode]
-      );
-
-      const user = upsertRes.rows[0];
-
-      const startPayload = ctx.startPayload;
-      if (startPayload) {
-        let payload = startPayload;
-        if (payload.startsWith("ref_")) {
-          payload = payload.slice(4);
-        }
-        const inviterId = Number(payload);
-
-        if (inviterId && inviterId !== telegramId) {
-          const refRes = await client.query(
-            `
-            SELECT *
-            FROM public.referrals
-            WHERE inviter_id = $1 AND invited_id = $2;
-          `,
-            [inviterId, telegramId]
-          );
-
-          if (refRes.rowCount === 0) {
-            await client.query(
-              `
-              INSERT INTO public.referrals (inviter_id, invited_id)
-              VALUES ($1, $2);
-            `,
-              [inviterId, telegramId]
-            );
-
-            // Tiered referral reward (multiplier based on inviter's current referrals_count)
-            if (STRICT_REFERRAL_ACTIVATION) {
-              // Delay referral rewards until the invited user shows real activity (anti-fraud).
-              // Reward will be granted by maybeActivateReferral() on taps / sponsor completion.
-            } else {
-            const inviterRes = await client.query(
-              `SELECT referrals_count FROM public.users WHERE telegram_id = $1 LIMIT 1;`,
-              [inviterId]
-            );
-            const tierInfo = getReferralTier(inviterRes.rowCount ? inviterRes.rows[0].referrals_count : 0);
-            const reward = Math.round(REFERRAL_REWARD * tierInfo.multiplier);
-
-            // Apply referral reward via ledger inside the existing transaction.
-            // We keep referrals_count / referrals_points updates in-place for now.
-            await applyBalanceChangeTx(client, {
-              userId: inviterRes.rows[0]?.id, // we'll re-fetch user id below if needed
-              delta: reward,
-              reason: "referral_reward",
-              refType: "user",
-              refId: null,
-              eventType: "referral_reward",
-            });
-
-            await client.query(
-              `
-              UPDATE public.users
-              SET referrals_count = referrals_count + 1,
-                  referrals_points = referrals_points + $1
-              WHERE telegram_id = $2;
-            `,
-              [reward, inviterId]
-            );
-            }
-          }
-        }
-      }
-
-      await client.query("COMMIT");
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
+    if (MAINTENANCE_MODE) {
+      await ctx.reply("JigCoin is being updated. Please try again shortly.");
+      return;
     }
+    await ensureSchemaOnce();
+    const user = await referralCredit.register(ctx.from, ctx.startPayload);
+    await referralCredit.settle(user);
 
     await ctx.reply(
       "🚀 Early access is live.\nStart farming now 👇",
@@ -5557,7 +5351,7 @@ bot.command("referral", async (ctx) => {
   const telegramId = ctx.from.id;
   const inviteLink = `https://t.me/${BOT_USERNAME}?startapp=ref_${telegramId}`;
   await ctx.reply(
-    `🔗 Your referral link:\n${inviteLink}\n\nShare this with friends and earn +${REFERRAL_REWARD} for each one who joins!`
+    `🔗 Your referral link:\n${inviteLink}\n\nInvite new friends. See your current reward and qualification rules in the Invite panel.`
   );
 });
 
@@ -5567,6 +5361,7 @@ async function start() {
   // Ensure Supabase schema is ready before accepting traffic.
   try {
     await ensureSchemaOnce();
+    await referralCredit.assertReady();
   } catch (err) {
     console.error("Fatal schema initialization error:", err);
     process.exit(1);
