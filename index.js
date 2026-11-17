@@ -14,7 +14,7 @@ const powerups = require("./lib/powerups");
 const { loadConfig } = require("./lib/config");
 const { createMonetagRewards } = require("./lib/monetagRewards");
 const { createProgression } = require("./lib/progression");
-const {dailyReward,restorePolicy} = require("./lib/streakPolicy");
+const {dailyRewardBreakdown,restorePolicy,STREAK_ECONOMY} = require("./lib/streakPolicy");
 const {createStreakRestore} = require("./lib/streakRestore");
 const { createStreakRewards } = require("./lib/streakRewards");
 const { createGameplay } = require("./lib/gameplay");
@@ -279,7 +279,7 @@ const ENERGY_REFILL_COST = 200;
 const DOUBLE_BOOST_COST = 200;
 
 // Daily check-in reward (fixed)
-const DAILY_CHECKIN_REWARD = 500;
+const DAILY_CHECKIN_REWARD = STREAK_ECONOMY.start;
 
 // VIP (points-based purchase in this build; swap to payments later)
 const VIP_MONTH_COST = 5000;
@@ -296,13 +296,9 @@ function getReferralTier(count) {
   return { tier: 0, multiplier: 1.0 };
 }
 
-// Streak milestone bonuses (added on top of DAILY_CHECKIN_REWARD)
-const STREAK_BONUS = [
-  { days: 3, bonus: 200 },
-  { days: 7, bonus: 500 },
-  { days: 14, bonus: 1000 },
-  { days: 30, bonus: 5000 },
-];
+// Legacy fixed-day coin bonuses are replaced by the capped daily ladder.
+// Every 100th consecutive check-in adds 2,000 to the normal 2,000 reward.
+const STREAK_BONUS = [];
 
 // ------------ Streak tiers (FOMO / scarcity tuned) ------------
 // Unlimited streak, tiered benefits, hard break after 1 missed UTC day.
@@ -4595,8 +4591,9 @@ async function handleDailyCheckin(req, res, verifiedTester = null) {
       const endpoint="/api/task/daily",context="daily",requestId=`${user.id}:${todayStr}`;
       const idem=await ensureIdempotencyKeyTx(client,{userId:user.id,endpoint,context,requestId});
       if(idem.status==="completed")return;
-      totalReward=dailyReward(newStreak,STREAK_BONUS);
-      bonus=STREAK_BONUS.filter(m=>m.days===newStreak).reduce((n,m)=>n+m.bonus,0);
+      const payout=dailyRewardBreakdown(newStreak);
+      totalReward=payout.total;
+      bonus=payout.bonus;
       await applyBalanceChangeTx(client,{userId:user.id,delta:totalReward,reason:"daily_bonus",refType:"daily",refId:null,eventType:"bonus"});
       if(shield)await powerups.consumePowerupUnitById(client,shield.id);
       await client.query(`UPDATE public.users SET streak_count = $1,last_checkin_at=NOW(),
@@ -4604,7 +4601,7 @@ async function handleDailyCheckin(req, res, verifiedTester = null) {
         WHERE id=$4`,[newStreak,todayStr,true,user.id]);
       await streakRewards.grant(client,user.id,newStreak);
       await client.query(`INSERT INTO public.streak_events(user_id,telegram_id,event,meta)
-        VALUES($1,$2,'checkin',$3::jsonb)`,[user.id,user.telegram_id,JSON.stringify({streak:newStreak,bonus,shield_used:!!shield})]);
+        VALUES($1,$2,'checkin',$3::jsonb)`,[user.id,user.telegram_id,JSON.stringify({streak:newStreak,base:payout.base,bonus,reward:totalReward,policy:STREAK_ECONOMY.version,shield_used:!!shield})]);
       await completeIdempotencyKeyTx(client,{endpoint,requestId,context,responsePayload:null});
       credited=true;
     });
