@@ -18,6 +18,7 @@ const {dailyRewardBreakdown,restorePolicy,STREAK_ECONOMY} = require("./lib/strea
 const {createStreakRestore} = require("./lib/streakRestore");
 const { createStreakRewards } = require("./lib/streakRewards");
 const { createGameplay } = require("./lib/gameplay");
+const { createInvite } = require("./lib/invite");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
 const crypto = require("crypto");
@@ -547,6 +548,8 @@ const getEnergyCap = user => getEffectiveMaxEnergy(user, getStreakMetaFromUser(u
 const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
   getMultiplier: user => { const meta=getStreakMetaFromUser(user); return meta.active ? Number(meta.tap_multiplier || 1) : 1; },
   packetMax: TAP_PACKET_MAX });
+const invite = createInvite({pool,getReferralTier,baseReward:REFERRAL_REWARD,botUsername:BOT_USERNAME,
+  strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
@@ -634,7 +637,7 @@ app.use(async (req, res, next) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -4669,6 +4672,12 @@ app.post("/api/friends", async (req, res) => {
 });
 
 
+
+// Invite display data: authenticated, account-scoped, no referral credits written.
+app.post("/api/invite/summary", monetagRewards.handler(async req =>
+  invite.summary(await getOrCreateUserFromInitData(req))));
+app.post("/api/invite/history", monetagRewards.handler(async req =>
+  invite.history(await getOrCreateUserFromInitData(req))));
 
 // Referral ladder status
 app.post("/api/referral/status", async (req, res) => {
