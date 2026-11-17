@@ -23,6 +23,8 @@ const { createReferralCredit } = require("./lib/referralCredit");
 const referralPolicy = require("./lib/referralPolicy");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
+const {createVipPass} = require("./lib/vipPass");
+const {benefits:vipBenefits} = require("./lib/vipPolicy");
 const crypto = require("crypto");
 const Stripe = require("stripe");
 const fetch = require("node-fetch");
@@ -270,9 +272,7 @@ const DOUBLE_BOOST_COST = 200;
 // Daily check-in reward (fixed)
 const DAILY_CHECKIN_REWARD = STREAK_ECONOMY.start;
 
-// VIP (points-based purchase in this build; swap to payments later)
-const VIP_MONTH_COST = 5000;
-const VIP_MAX_ENERGY = 75;
+// VIP v11 is a 30-day Stars pass; capacity and tap policy live in vipPolicy.js.
 
 // Referral ladder (server-side tiers)
 function getReferralTier(count) { return referralPolicy.currentTier(count); }
@@ -359,15 +359,12 @@ function isVipActive(user) {
   }
 }
 
-function getEffectiveMaxEnergy(user, streakMeta) {
-  const base = Number(user.max_energy || 50);
-  const vipCap = isVipActive(user) ? Math.max(base, VIP_MAX_ENERGY) : base;
-  const bonus = streakMeta && streakMeta.active ? Number(streakMeta.energy_bonus || 0) : 0;
-  return vipCap + bonus;
+function getEffectiveMaxEnergy(user, streakMeta, now=Date.now()) {
+  return vipBenefits(user,streakMeta,now).energy;
 }
 
-function getStreakMetaFromUser(user) {
-  const now = new Date();
+function getStreakMetaFromUser(user, at=Date.now()) {
+  const now = new Date(at);
   const streakCount = Math.max(0, Math.floor(Number(user.streak_count || 0)));
 
   // Prefer `last_checkin_at` (timestamptz). Fall back to legacy `last_checkin_date` (date).
@@ -524,9 +521,9 @@ async function fulfillStreakRestoreByTelegramId({ telegramId, sku, provider, pro
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
-const getEnergyCap = user => getEffectiveMaxEnergy(user, getStreakMetaFromUser(user));
+const getEnergyCap = (user,now=Date.now()) => getEffectiveMaxEnergy(user, getStreakMetaFromUser(user,now),now);
 const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
-  getMultiplier: user => { const meta=getStreakMetaFromUser(user); return meta.active ? Number(meta.tap_multiplier || 1) : 1; },
+  getMultiplier: (user,now) => { const meta=getStreakMetaFromUser(user,now); return meta.active ? Number(meta.tap_multiplier || 1) : 1; },
   packetMax: TAP_PACKET_MAX });
 const referralCredit = createReferralCredit({pool,withTransaction,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
@@ -537,7 +534,8 @@ const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanc
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
 const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS,restoreEnabled:streakRestore.enabled});
 const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS,streakRewards});
-const starsShop = createStarsShop({streakRestore,pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
+const vipPass = createVipPass({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env),getStreakMeta:getStreakMetaFromUser});
+const starsShop = createStarsShop({vipPass,streakRestore,pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
 
 app.use(cors());
 // Capture raw body for Stripe webhook signature verification (without breaking JSON parsing)
@@ -597,9 +595,15 @@ app.use(async (req, res, next) => {
   next();
 });
 
+app.post("/api/admin/vip/refund", async (req,res) => {
+  if (!requireAdmin(req,res)) return;
+  try { res.json(await vipPass.refundOrder(req.body?.order_id)); }
+  catch(e) { res.status(e.status||503).json({ok:false,error:e.code||"VIP_REFUND_FAILED"}); }
+});
+
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -877,79 +881,9 @@ app.get("/api/shop/starter-offer", async (req, res) => {
 });
 
 // ------------ VIP Shop ------------
-// A) Read active VIP product config.
-//
-// Prefer payment_products (Coinbase Commerce checkout URLs) if present.
-// Fallback to vip_products for older Stripe-based deployments.
-app.post("/api/vip/product", async (req, res) => {
-  try {
-    const fp = req._fp || getClientFingerprint(req);
-    if (!hit(`vipprod:${fp}`, 30, 60_000)) {
-      return res.status(429).json({ ok: false, error: "RATE_LIMIT" });
-    }
-
-    // 1) Coinbase Commerce / generic provider (payment_products)
-    // We store VIP as pack_sku = 'vip_30d' with amount_minor in pennies.
-    const { rows: ppRows } = await pool.query(
-      `
-      SELECT pack_sku, title, description, currency, amount_minor, checkout_url
-      FROM public.payment_products
-      WHERE active = TRUE
-        AND provider = 'coinbase'
-        AND pack_sku = 'vip_30d'
-      LIMIT 1;
-      `
-    );
-
-    if (ppRows.length) {
-      const p = ppRows[0];
-      return res.json({
-        ok: true,
-        product: {
-          sku: p.pack_sku,
-          title: p.title || 'JigCoin VIP Pass (30 days)',
-          duration_days: 30,
-          price_gbp: p.amount_minor == null ? null : Number(p.amount_minor) / 100,
-          // Keep legacy field name used by the current frontend
-          stripe_payment_link: p.checkout_url,
-          checkout_url: p.checkout_url,
-          currency: p.currency || 'GBP',
-          active: true,
-        },
-      });
-    }
-
-    // 2) Legacy Stripe-based table
-    const { rows } = await pool.query(
-      `
-      SELECT sku, title, duration_days, price_gbp, stripe_payment_link, active, created_at
-      FROM public.vip_products
-      WHERE active = TRUE
-      ORDER BY id DESC
-      LIMIT 1;
-      `
-    );
-
-    if (!rows.length) return res.json({ ok: true, product: null });
-
-    const p = rows[0];
-    return res.json({
-      ok: true,
-      product: {
-        sku: p.sku,
-        title: p.title,
-        duration_days: Number(p.duration_days || 30),
-        price_gbp: p.price_gbp == null ? null : Number(p.price_gbp),
-        stripe_payment_link: p.stripe_payment_link,
-        active: !!p.active,
-      },
-    });
-  } catch (err) {
-    console.error("Error /api/vip/product:", err);
-    return res.status(500).json({ ok: false, error: "VIP_PRODUCT_ERROR" });
-  }
-});
-
+// Account-scoped combined VIP offer/status: one request, one price contract.
+app.post("/api/vip/overview", starsShop.handler(async req => vipPass.overview(await getOrCreateUserFromInitData(req))));
+app.post("/api/vip/product", starsShop.handler(async req => vipPass.overview(await getOrCreateUserFromInitData(req))));
 
 // ------------ Unified checkout (Stripe card OR Coinbase crypto) ------------
 // Frontend calls this for BOTH coin packs and VIP so users can choose a payment method.
@@ -1078,6 +1012,7 @@ app.post("/api/payments/create-checkout", async (req, res) => {
 
     const telegramId = Number(req.body.telegram_id || 0);
     const sku = normalizeSku(req.body.sku);
+    if(isVipSku(sku)||/^VIP_/i.test(sku))return res.status(410).json({ok:false,error:"USE_STARS_VIP"});
     const provider = String(req.body.provider || "stripe").toLowerCase();
 
     if (!telegramId) return res.status(400).json({ ok: false, error: "MISSING_TELEGRAM_ID" });
@@ -1113,79 +1048,8 @@ app.post("/api/payments/create-checkout", async (req, res) => {
 });
 
 // B) Create Stripe Checkout Session (recommended) and return session.url
-app.post("/api/vip/create-checkout", async (req, res) => {
-  try {
-    const fp = req._fp || getClientFingerprint(req);
-    if (!hit(`vipco:${fp}`, 20, 60_000)) {
-      return res.status(429).json({ ok: false, error: "RATE_LIMIT" });
-    }
-
-    const telegramId = Number(req.body.telegram_id || 0);
-    if (!telegramId) {
-      return res.status(400).json({ ok: false, error: "MISSING_TELEGRAM_ID" });
-    }
-
-    // Stripe config check
-    if (!stripe) {
-      return res.status(500).json({ ok: false, error: "STRIPE_NOT_CONFIGURED" });
-    }
-    if (!APP_BASE_URL) {
-      return res.status(500).json({ ok: false, error: "APP_BASE_URL_MISSING" });
-    }
-
-    // Load active VIP product
-    const { rows } = await pool.query(
-      `
-      SELECT sku, title, duration_days, price_gbp, stripe_payment_link
-      FROM public.vip_products
-      WHERE active = TRUE
-      ORDER BY id DESC
-      LIMIT 1;
-      `
-    );
-    if (!rows.length) {
-      return res.status(404).json({ ok: false, error: "NO_ACTIVE_VIP_PRODUCT" });
-    }
-    const p = rows[0];
-    const durationDays = Math.max(1, Math.min(365, Number(p.duration_days || 30)));
-    const priceGbp = Number(p.price_gbp || 0);
-    if (!Number.isFinite(priceGbp) || priceGbp <= 0) {
-      return res.status(400).json({ ok: false, error: "BAD_VIP_PRICE" });
-    }
-
-    // Create Checkout Session
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: "gbp",
-            product_data: {
-              name: String(p.title || "VIP Pass"),
-            },
-            unit_amount: Math.round(priceGbp * 100),
-          },
-          quantity: 1,
-        },
-      ],
-      // In Telegram we don't rely on success redirect for activation; webhook activates VIP.
-      success_url: `${APP_BASE_URL}?vip=success`,
-      cancel_url: `${APP_BASE_URL}?vip=cancel`,
-      client_reference_id: String(telegramId),
-      metadata: {
-        telegram_id: String(telegramId),
-        sku: String(p.sku || "VIP_30D"),
-        duration_days: String(durationDays),
-      },
-    });
-
-    return res.json({ ok: true, url: session.url, session_id: session.id });
-  } catch (err) {
-    console.error("Error /api/vip/create-checkout:", err);
-    return res.status(500).json({ ok: false, error: "VIP_CHECKOUT_ERROR" });
-  }
-});
+app.post("/api/vip/create-checkout", starsShop.handler(async req => vipPass.invoice(await getOrCreateUserFromInitData(req),req.body)));
+app.post("/api/vip/order-status", starsShop.handler(async req => vipPass.status(await getOrCreateUserFromInitData(req),req.body.order_id)));
 
 // Stripe webhook: activates VIP on successful payment
 // IMPORTANT: set STRIPE_WEBHOOK_SECRET in Render + configure endpoint in Stripe.
@@ -2069,108 +1933,14 @@ async function maybeActivateReferral(invitedUser) {
 
 // ------------ Energy Regeneration (Hybrid Model) ------------
 async function applyEnergyRegen(user) {
-  const streakMeta = getStreakMetaFromUser(user);
-  const maxEnergy = getEffectiveMaxEnergy(user, streakMeta);
-  const now = new Date();
-
-  // If never had regen timestamp → assume long offline
-  if (!user.last_energy_ts) {
-    user.last_energy_ts = new Date(now.getTime() - 60 * 60 * 1000);
-  }
-
-  const last = new Date(user.last_energy_ts);
-  let diffSeconds = Math.floor((now - last) / 1000);
-  if (diffSeconds <= 0) return user;
-
-  let energy = Number(user.energy || 0);
-
-  while (diffSeconds > 0 && energy < maxEnergy) {
-    let step;
-
-    if (energy < 10) step = 1;      // fast regen
-    else if (energy < 30) step = 3; // medium regen
-    else step = 6;                  // slow regen
-
-    if (diffSeconds >= step) {
-      energy += 1;
-      diffSeconds -= step;
-    } else break;
-  }
-
-  if (energy > maxEnergy) energy = maxEnergy;
-
-  await pool.query(
-    `
-    UPDATE public.users
-    SET energy = $1,
-        last_energy_ts = NOW()
-    WHERE id = $2
-    `,
-    [energy, user.id]
-  );
-
-  user.energy = energy;
-  user.last_energy_ts = now;
-
-  return user;
+  return withTransaction(async c=>{
+    const locked=(await c.query('SELECT *,clock_timestamp() AS db_now FROM public.users WHERE id=$1 FOR UPDATE',[user.id])).rows[0];
+    const fresh=gameplay.project(locked,new Date(locked.db_now));
+    return (await c.query(`UPDATE public.users SET energy=$2,last_energy_ts=$3,last_reset=$4,today_farmed=$5,taps_today=$6 WHERE id=$1 RETURNING *`,
+      [user.id,fresh.energy,fresh.last_energy_ts,fresh.last_reset,fresh.today_farmed,fresh.taps_today])).rows[0];
+  });
 }
-
-// ------------ Daily reset logic ------------
-async function ensureDailyReset(user) {
-  const today = todayDate();
-  let lastResetStr = null;
-
-  try {
-    if (user.last_reset) {
-      if (typeof user.last_reset === "string") {
-        lastResetStr = user.last_reset.slice(0, 10);
-      } else {
-        const tmp = new Date(user.last_reset);
-        if (!isNaN(tmp)) lastResetStr = tmp.toISOString().slice(0, 10);
-      }
-    }
-  } catch (e) {
-    console.error("Bad last_reset:", user.last_reset, e);
-    lastResetStr = null;
-  }
-
-  if (lastResetStr === today) return user;
-
-  const updated = await pool.query(
-    `
-      UPDATE public.users
-      SET today_farmed = 0,
-          taps_today = 0,
-          last_reset = $1
-      WHERE id = $2
-      RETURNING *;
-    `,
-    [today, user.id]
-  );
-
-
-  let fresh = updated.rows[0];
-
-  // Refill energy to the effective cap (VIP + active streak bonus)
-  try {
-    const streakMeta = getStreakMetaFromUser(fresh);
-    const cap = getEffectiveMaxEnergy(fresh, streakMeta);
-    const r2 = await pool.query(
-      `
-      UPDATE public.users
-      SET energy = $1,
-          last_energy_ts = NOW()
-      WHERE id = $2
-      RETURNING *;
-      `,
-      [cap, fresh.id]
-    );
-    if (r2.rows && r2.rows[0]) fresh = r2.rows[0];
-  } catch (e) {}
-
-  return fresh;
-
-}
+async function ensureDailyReset(user) { return applyEnergyRegen(user); }
 
 // ------------ Legacy tap helper (kept for compatibility) ------------
 async function handleTap(user) {
@@ -2356,7 +2126,9 @@ async function buildClientState(user, { readOnly = false } = {}) {
     global_total: total,
     double_boost_active: doubleBoostActive,
     double_boost_until: doubleBoostUntil,
-    vip_active: user.vip_until ? new Date(user.vip_until) > new Date() : false,
+    vip_active: vipBenefits(user,streak_meta).active,
+    vip_benefits: vipBenefits(user,streak_meta),
+    tap_rate: vipBenefits(user,streak_meta).tap,
     vip_until: user.vip_until ? new Date(user.vip_until).toISOString() : null,
     vip_tier: Number(user.vip_tier || 0),
     streak_count: Number(user.streak_count || 0),
@@ -2965,115 +2737,8 @@ app.get("/api/state-debug", async (req, res) => {
 });
 
 // Tap route – regen + spend 1 energy + add points (x2 if boost)
-app.post("/api/tap", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
-
-    // Per-user burst limiter (separate from fingerprint)
-    if (!hit(`tapburst:u:${user.telegram_id}`, 12, 1000)) {
-      return res.status(429).json({ ok: false, error: "TAP_RATE_LIMIT" });
-    }
-    // Hard ban gate
-    if (user.banned_until && new Date(user.banned_until) > new Date()) {
-      const state = await buildClientState(user);
-      return res.status(403).json({ ...state, ok: false, reason: "BANNED" });
-    }
-
-    const fp = req._fp || getClientFingerprint(req);
-    if (!hit(`tapburst:${fp}`, 25, 1000)) {
-      return res.status(429).json({ ok: false, error: "TAP_RATE_LIMIT" });
-    }
-
-    // 1) Refill energy first, based on last_energy_ts
-    user = await applyEnergyRegen(user);
-
-    // 2) New day? reset today_farmed, taps_today, and refill to max
-    user = await ensureDailyReset(user);
-
-    // 3) If no energy, don't allow tap
-    const currentEnergy = Number(user.energy || 0);
-    if (currentEnergy <= 0) {
-      const state = await buildClientState(user);
-      return res.json({ ...state, ok: false, reason: "NO_ENERGY" });
-    }
-
-    // Daily tap counts track activity without imposing an earning cap.
-    const currentTaps = Number(user.taps_today || 0);
-
-    // 5) Spend 1 energy + add points (double if boost still active)
-    const basePerTap = 1;
-    const now = new Date();
-    let perTap = basePerTap;
-
-    if (user.double_boost_until) {
-      const until = new Date(user.double_boost_until);
-      if (!isNaN(until) && until > now) {
-        perTap = basePerTap * 2;
-      }
-    }
-
-    // Streak multiplier (only when streak is active)
-    try {
-      const streakMeta = getStreakMetaFromUser(user);
-      if (streakMeta && streakMeta.active && Number(streakMeta.tap_multiplier || 1) > 1) {
-        perTap = perTap * Number(streakMeta.tap_multiplier || 1);
-      }
-    } catch (e) {}
-
-    const delta = Math.max(1, Math.floor(perTap));
-    const newEnergy = currentEnergy - 1;
-    const newToday = Number(user.today_farmed || 0) + delta;
-    const newTaps = currentTaps + 1;
-
-    // 5a) Apply the tap reward via the balance ledger
-    await applyBalanceChange({
-      userId: user.id,
-      delta,
-      reason: "tap_reward",
-      refType: "tap",
-      refId: null,
-      eventType: "tap",
-    });
-
-    // 5b) Update energy + tap counters without touching balance
-    const upd = await pool.query(
-      `
-      UPDATE public.users
-      SET energy         = $1,
-          today_farmed   = $2,
-          taps_today     = $3,
-          last_energy_ts = NOW()
-      WHERE id = $4
-      RETURNING *;
-      `,
-      [newEnergy, newToday, newTaps, user.id]
-    );
-
-    if (!upd.rowCount) {
-        const freshQ = await pool.query(`SELECT * FROM public.users WHERE id = $1 LIMIT 1;`, [user.id]);
-        const freshUser = freshQ.rows[0] || user;
-        const state = await buildClientState(freshUser);
-        const maxE = Number(freshUser.max_energy || 50);
-        const curE = Number(freshUser.energy || 0);
-        const curB = Number(freshUser.balance || 0);
-        const reason =
-          curE >= maxE ? "ENERGY_FULL" :
-          curB < ENERGY_REFILL_COST ? "NOT_ENOUGH_POINTS" :
-          "BOOST_NOT_APPLIED";
-        return res.json({ ...state, ok: false, reason });
-      }
-      updatedUser = upd.rows[0];
-    // Referral activation (anti-fraud): only rewards after real activity
-    const settledUser = await maybeActivateReferral(updatedUser);
-    const state = await buildClientState(settledUser);
-    return res.json({ ...state, ok: true });
-  } catch (err) {
-    console.error("Error /api/tap:", err);
-    res.status(500).json({ ok: false, error: "TAP_ERROR" });
-  }
-});
-
-
+// Old non-idempotent tap clients must refresh; the current app uses tapPacket.
+app.post("/api/tap", (_req,res)=>res.status(410).json({ok:false,error:"USE_TAP_PACKET"}));
 
 // Tap packet route – batch taps for better anti-bot validation + lower server load
 // Body: { count: number, client?: {...} }
@@ -3109,7 +2774,7 @@ app.post("/api/boost/energy", async (req, res) => {
       });
     }
 
-    const maxEnergy = Number(user.max_energy || 50);
+    const maxEnergy = getEnergyCap(user);
     const currentEnergy = Number(user.energy || 0);
 
     if (currentEnergy >= maxEnergy) {
@@ -3422,131 +3087,12 @@ app.post("/api/boost/double", async (req, res) => {
 });
 
 
-// ------------ VIP API (points-based for now) ------------
+// ------------ VIP API (confirmed Telegram Stars entitlement) ------------
 
 // Get VIP status
-app.post("/api/vip/status", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
-    user = await applyEnergyRegen(user);
-    user = await ensureDailyReset(user);
-
-    const now = new Date();
-    const telegramId = Number(req.body.telegram_id || user.telegram_id || 0);
-
-    // Prefer Stripe-driven VIP (public.user_vip) if present; fall back to legacy users.vip_until.
-    let vipUntil = user.vip_until ? new Date(user.vip_until) : null;
-    if (telegramId) {
-      try {
-        const r = await pool.query(
-          `SELECT vip_until, vip_last_claim FROM public.user_vip WHERE telegram_id = $1 LIMIT 1;`,
-          [telegramId]
-        );
-        if (r.rows.length && r.rows[0].vip_until) {
-          vipUntil = new Date(r.rows[0].vip_until);
-          // Attach for later use (optional)
-          user._vip_last_claim = r.rows[0].vip_last_claim || null;
-        }
-      } catch (e) {
-        // If table doesn't exist yet or permissions differ, ignore and keep legacy behaviour.
-      }
-    }
-
-    const active = vipUntil && !isNaN(vipUntil) && vipUntil > now;
-    const vipUntilIso = vipUntil && !isNaN(vipUntil) ? vipUntil.toISOString() : null;
-    const lastClaim = user._vip_last_claim ? String(user._vip_last_claim) : null;
-    const canClaim = active && (!lastClaim || lastClaim !== todayDate());
-
-    return res.json({
-      ...(await buildClientState(user)),
-      ok: true,
-      // Frontend-friendly fields
-      vip_active: active,
-      vip_until: vipUntilIso,
-      vip_can_claim: canClaim,
-      vip: {
-        active,
-        tier: Number(user.vip_tier || 0),
-        vip_until: vipUntilIso,
-        perks: {
-          max_energy: active ? VIP_MAX_ENERGY : Number(user.max_energy || 50),
-          daily_tap_cap: null,
-          daily_taps_unlimited: true,
-        },
-      },
-    });
-  } catch (err) {
-    console.error("Error /api/vip/status:", err);
-    res.status(500).json({ ok: false, error: "VIP_STATUS_ERROR" });
-  }
-});
-
-// Buy VIP (method: points; months default 1)
-app.post("/api/vip/buy", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
-    const months = Math.max(1, Math.min(12, Number(req.body.months || 1)));
-    const method = req.body.method === "points" ? "points" : "points";
-
-    const cost = VIP_MONTH_COST * months;
-    if (method === "points") {
-      const bal = Number(user.balance || 0);
-      if (bal < cost) {
-        return res.json({ ...(await buildClientState(user)), ok: false, reason: "NOT_ENOUGH_POINTS", cost });
-      }
-      const now = new Date();
-      const currentUntil = user.vip_until && !isNaN(new Date(user.vip_until)) ? new Date(user.vip_until) : now;
-      const base = currentUntil > now ? currentUntil : now;
-      const newUntil = new Date(base.getTime() + months * 30 * 24 * 60 * 60 * 1000);
-
-      // 1) Apply the VIP purchase cost via the balance ledger
-      await applyBalanceChange({
-        userId: user.id,
-        delta: -cost,
-        reason: "vip_purchase",
-        refType: "vip",
-        refId: null,
-        eventType: "spend",
-      });
-
-      // 2) Update VIP flags and energy caps without touching balance directly
-      const upd = await pool.query(
-        `
-        UPDATE public.users
-        SET vip_until = $1,
-            vip_tier = GREATEST(COALESCE(vip_tier, 0), 1),
-            max_energy = GREATEST(COALESCE(max_energy, 50), $2),
-            energy = LEAST(GREATEST(COALESCE(energy, 0), 0), GREATEST(COALESCE(max_energy, 50), $2))
-        WHERE id = $3
-        RETURNING *;
-        `,
-        [newUntil.toISOString(), VIP_MAX_ENERGY, user.id]
-      );
-      user = upd.rows[0];
-
-      await pool.query(
-        `
-        INSERT INTO public.vip_purchases (user_id, tier, method, amount_paid, months)
-        VALUES ($1, 1, $2, $3, $4);
-        `,
-        [user.id, method, cost, months]
-      );
-
-      return res.json({
-        ...(await buildClientState(user)),
-        ok: true,
-        message: `👑 VIP activated for ${months} month(s)!`,
-      });
-    }
-
-    return res.status(400).json({ ok: false, error: "BAD_METHOD" });
-  } catch (err) {
-    console.error("Error /api/vip/buy:", err);
-    res.status(500).json({ ok: false, error: "VIP_BUY_ERROR" });
-  }
-});
-
-
+app.post("/api/vip/status", starsShop.handler(async req => vipPass.overview(await getOrCreateUserFromInitData(req))));
+// Retired earned-coin purchase route. Already-owned time is migrated and honored.
+app.post("/api/vip/buy", (_req,res)=>res.status(410).json({ok:false,error:"USE_STARS_VIP"}));
 
 // ------------ Events / Seasons API ------------
 
@@ -5241,6 +4787,7 @@ async function start() {
   try {
     await ensureSchemaOnce();
     await referralCredit.assertReady();
+    await vipPass.assertReady();
   } catch (err) {
     console.error("Fatal schema initialization error:", err);
     process.exit(1);
