@@ -25,6 +25,7 @@ const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
 const {createVipPass} = require("./lib/vipPass");
 const {benefits:vipBenefits} = require("./lib/vipPolicy");
+const {createLeaderboards} = require("./lib/leaderboards");
 const crypto = require("crypto");
 const Stripe = require("stripe");
 const fetch = require("node-fetch");
@@ -534,6 +535,7 @@ const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanc
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
 const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS,restoreEnabled:streakRestore.enabled});
 const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS,streakRewards});
+const leaderboards=createLeaderboards({pool,streakRewards});
 const vipPass = createVipPass({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env),getStreakMeta:getStreakMetaFromUser});
 const starsShop = createStarsShop({vipPass,streakRestore,pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
 
@@ -603,7 +605,7 @@ app.post("/api/admin/vip/refund", async (req,res) => {
 
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -1998,26 +2000,7 @@ async function handleTap(user) {
   return updated.rows[0];
 }
 // ------------ Global rank helper ------------
-async function getGlobalRankForUser(user) {
-  // Match both leaderboard endpoints exactly, including tied balances. One query
-  // keeps the position and player count in the same database snapshot.
-  const result = await pool.query(
-    `
-    SELECT ranked.position, ranked.total, ranked.balance
-    FROM (
-      SELECT id, balance,
-        ROW_NUMBER() OVER (ORDER BY balance DESC, telegram_id ASC) AS position,
-        COUNT(*) OVER () AS total
-      FROM public.users
-    ) AS ranked
-    WHERE ranked.id = $1;
-    `,
-    [user.id]
-  );
-  const row = result.rows[0];
-  return row ? { rank: Number(row.position), total: Number(row.total), balance: row.balance == null ? null : Number(row.balance) }
-             : { rank: null, total: 0 };
-}
+async function getGlobalRankForUser(user) { return leaderboards.rank(user); }
 
 // ------------ Build state for frontend ------------
 async function buildClientState(user, { readOnly = false } = {}) {
@@ -4362,350 +4345,17 @@ app.post("/api/admin/withdraw/update", async (req, res) => {
     res.status(500).json({ ok: false, error: "ADMIN_WITHDRAW_UPDATE_ERROR" });
   }
 });
-// ------------ Global leaderboard ------------
-app.post("/api/leaderboard/global", async (req, res) => {
-  try {
-    let user = null;
-    try {
-      user = await getOrCreateUserFromInitData(req);
-    } catch (e) {
-      console.error(
-        "getOrCreateUserFromInitData failed in GLOBAL leaderboard:",
-        e.message || e
-      );
-    }
-
-    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
-
-    const lbRes = await pool.query(
-      `
-      SELECT
-        telegram_id,
-        username,
-        first_name,
-        last_name,
-        balance
-      FROM public.users
-      ORDER BY balance DESC, telegram_id ASC
-      LIMIT $1;
-    `,
-      [limit]
-    );
-
-    const rows = lbRes.rows.map((r, idx) => ({
-      telegram_id: Number(r.telegram_id),
-      username: r.username,
-      first_name: r.first_name,
-      last_name: r.last_name,
-      balance: Number(r.balance || 0),
-      global_rank: idx + 1,
-    }));
-
-    let me = null;
-    if (user && user.telegram_id) {
-      const rankInfo = await getGlobalRankForUser(user);
-      me = {
-        telegram_id: Number(user.telegram_id),
-        balance: Number(user.balance || 0),
-        global_rank: rankInfo.rank,
-        global_total: rankInfo.total,
-      };
-    }
-
-    res.json({
-      ok: true,
-      me,
-      global: await streakRewards.decorate(rows),
-    });
-  } catch (err) {
-    console.error("Error /api/leaderboard/global:", err);
-    res.status(500).json({ ok: false, error: "LEADERBOARD_GLOBAL_ERROR" });
-  }
-});
-
-// ------------ Leaderboard window (3 above / me / 3 below) ------------
-// This powers "pressure" UI without faking numbers.
-app.post("/api/leaderboard/window", async (req, res) => {
-  try {
-    const user = await getOrCreateUserFromInitData(req);
-    if (!user || !user.telegram_id) {
-      return res.json({ ok: true, me: null, window: [], overtake: null, threatened: false });
-    }
-
-    const myTid = Number(user.telegram_id);
-
-    const q = await pool.query(
-      `
-      WITH ranked AS (
-        SELECT
-          telegram_id,
-          username,
-          first_name,
-          last_name,
-          balance,
-          ROW_NUMBER() OVER (ORDER BY balance DESC, telegram_id ASC) AS rn,
-          COUNT(*) OVER () AS total
-        FROM public.users
-      ),
-      me AS (
-        SELECT rn, total, balance
-        FROM ranked
-        WHERE telegram_id = $1
-        LIMIT 1
-      ),
-      win AS (
-        SELECT *
-        FROM ranked
-        WHERE rn BETWEEN (SELECT rn FROM me) - 3 AND (SELECT rn FROM me) + 3
-      )
-      SELECT
-        w.telegram_id,
-        w.username,
-        w.first_name,
-        w.last_name,
-        w.balance,
-        w.rn,
-        (SELECT rn FROM me) AS me_rn,
-        (SELECT total FROM me) AS total,
-        (SELECT balance FROM me) AS me_balance
-      FROM win w
-      ORDER BY w.rn ASC;
-      `,
-      [myTid]
-    );
-
-    if (!q.rows.length) {
-      return res.json({ ok: true, me: null, window: [], overtake: null, threatened: false });
-    }
-
-    const meRn = Number(q.rows[0].me_rn);
-    const total = Number(q.rows[0].total);
-    const meBalance = Number(q.rows[0].me_balance || 0);
-
-    const windowRows = q.rows.map((r) => ({
-      telegram_id: Number(r.telegram_id),
-      username: r.username,
-      first_name: r.first_name,
-      last_name: r.last_name,
-      balance: Number(r.balance || 0),
-      global_rank: Number(r.rn),
-    }));
-
-    const meEntry = windowRows.find((x) => x.telegram_id === myTid) || {
-      telegram_id: myTid,
-      balance: meBalance,
-      global_rank: meRn,
-    };
-
-    const above = windowRows.find((x) => x.global_rank === meRn - 1) || null;
-    const below = windowRows.find((x) => x.global_rank === meRn + 1) || null;
-
-    const distance_to_next = above ? Math.max(0, Number(above.balance || 0) - meBalance) : 0;
-
-    // "Threat" is based on how close the next person below is.
-    // We keep this conservative (no lies) and scale with your current balance.
-    const gapBelow = below ? Math.max(0, meBalance - Number(below.balance || 0)) : null;
-    const dangerThreshold = Math.max(500, Math.floor(meBalance * 0.01)); // 1% or 500 min
-    const threatened = gapBelow != null ? gapBelow <= dangerThreshold : false;
-
-    const overtake = above && above.balance > meBalance
-      ? {
-          target_telegram_id: above.telegram_id,
-          target_display_name: above.username || above.first_name || "player",
-          need_points: Number(above.balance || 0) - meBalance,
-        }
-      : null;
-
-    return res.json({
-      ok: true,
-      me: {
-        telegram_id: myTid,
-        balance: meBalance,
-        global_rank: meRn,
-        global_total: total,
-        distance_to_next,
-      },
-      window: await streakRewards.decorate(windowRows),
-      overtake,
-      threatened,
-    });
-  } catch (err) {
-    console.error("Error /api/leaderboard/window:", err);
-    return res.status(500).json({ ok: false, error: "LEADERBOARD_WINDOW_ERROR" });
-  }
-});
-
-// ------------ Daily leaderboard (today_farmed) ------------
-app.post("/api/leaderboard/daily", async (req, res) => {
-  try {
-    let user = null;
-    try {
-      user = await getOrCreateUserFromInitData(req);
-    } catch (e) {
-      console.error(
-        "getOrCreateUserFromInitData failed in DAILY leaderboard:",
-        e.message || e
-      );
-    }
-
-    const limit = Math.max(1, Math.min(200, Number(req.body.limit || 100)));
-
-    const lbRes = await pool.query(
-      `
-      SELECT
-        telegram_id,
-        username,
-        first_name,
-        last_name,
-        today_farmed
-      FROM public.users
-      ORDER BY today_farmed DESC, telegram_id ASC
-      LIMIT $1;
-    `,
-      [limit]
-    );
-
-    const rows = lbRes.rows.map((r, idx) => ({
-      telegram_id: Number(r.telegram_id),
-      username: r.username,
-      first_name: r.first_name,
-      last_name: r.last_name,
-      today_farmed: Number(r.today_farmed || 0),
-      daily_rank: idx + 1,
-    }));
-
-    const totalRes = await pool.query(`SELECT COUNT(*) AS count FROM public.users;`);
-    const total = Number(totalRes.rows[0].count || 0);
-
-    const myTid = user && user.telegram_id ? Number(user.telegram_id) : null;
-
-    let myRank = null;
-    if (myTid !== null && total > 0) {
-      const myRowRes = await pool.query(
-        `SELECT today_farmed FROM public.users WHERE telegram_id = $1 LIMIT 1;`,
-        [myTid]
-      );
-      if (myRowRes.rowCount > 0) {
-        const myToday = Number(myRowRes.rows[0].today_farmed || 0);
-        const aboveRes = await pool.query(
-          `SELECT COUNT(*) AS count FROM public.users WHERE today_farmed > $1;`,
-          [myToday]
-        );
-        const countAbove = Number(aboveRes.rows[0].count || 0);
-        myRank = countAbove + 1;
-      }
-    }
-
-    res.json({
-      ok: true,
-      me:
-        myTid !== null
-          ? {
-              telegram_id: myTid,
-              today_farmed: Number(user.today_farmed || 0),
-              daily_rank: myRank,
-              daily_total: total,
-            }
-          : null,
-      daily: await streakRewards.decorate(rows),
-    });
-  } catch (err) {
-    console.error("Error /api/leaderboard/daily:", err);
-    res.status(500).json({ ok: false, error: "LEADERBOARD_DAILY_ERROR" });
-  }
-});
-
-// ------------ Friends leaderboard ------------
-app.post("/api/leaderboard/friends", async (req, res) => {
-  try {
-    let user = null;
-    try {
-      user = await getOrCreateUserFromInitData(req);
-    } catch (e) {
-      console.error(
-        "getOrCreateUserFromInitData failed in FRIENDS leaderboard:",
-        e.message || e
-      );
-    }
-
-    if (!user || !user.telegram_id) {
-      return res.json({
-        ok: true,
-        me: null,
-        friends: [],
-        overtake: null,
-      });
-    }
-
-    const myTid = Number(user.telegram_id);
-
-    const friendsRes = await pool.query(
-      `
-      SELECT DISTINCT
-        CASE
-          WHEN inviter_id = $1 THEN invited_id
-          WHEN invited_id = $1 THEN inviter_id
-        END AS friend_id
-      FROM public.referrals
-      WHERE inviter_id = $1 OR invited_id = $1;
-    `,
-      [myTid]
-    );
-
-    const friendIds = friendsRes.rows
-      .map((r) => Number(r.friend_id))
-      .filter((v) => !!v && v !== myTid);
-
-    const idsForQuery = friendIds.length > 0 ? [...friendIds, myTid] : [myTid];
-
-    const usersRes = await pool.query(
-      `
-      SELECT telegram_id, username, first_name, last_name, balance
-      FROM public.users
-      WHERE telegram_id = ANY($1::bigint[]);
-    `,
-      [idsForQuery]
-    );
-
-    const list = usersRes.rows
-      .map((r) => ({
-        telegram_id: Number(r.telegram_id),
-        username: r.username,
-        first_name: r.first_name,
-        last_name: r.last_name,
-        balance: Number(r.balance || 0),
-      }))
-      .sort((a, b) => b.balance - a.balance || a.telegram_id - b.telegram_id)
-      .map((r, idx) => ({
-        ...r,
-        friend_rank: idx + 1,
-      }));
-
-    const meEntry = list.find((x) => x.telegram_id === myTid) || null;
-
-    let overtake = null;
-    if (meEntry) {
-      const ahead = list.find((x) => x.friend_rank === meEntry.friend_rank - 1);
-      if (ahead && ahead.balance > meEntry.balance) {
-        overtake = {
-          target_telegram_id: ahead.telegram_id,
-          target_display_name: ahead.username || ahead.first_name || "friend",
-          need_points: ahead.balance - meEntry.balance,
-        };
-      }
-    }
-
-    res.json({
-      ok: true,
-      me: meEntry,
-      friends: await streakRewards.decorate(list),
-      overtake,
-    });
-  } catch (err) {
-    console.error("Error /api/leaderboard/friends:", err);
-    res.status(500).json({ ok: false, error: "LEADERBOARD_FRIENDS_ERROR" });
-  }
-});
+// ------------ Unified, authenticated leaderboard snapshots (v12) ------------
+for (const mode of ['global','daily','friends']) {
+ app.post('/api/leaderboard/'+mode,leaderboards.handler(async req=>
+  leaderboards.board(await getOrCreateUserFromInitData(req),mode,req.body)));
+}
+app.post('/api/leaderboard/window',leaderboards.handler(async req=>
+ leaderboards.board(await getOrCreateUserFromInitData(req),'global',{})));
+app.post('/api/leaderboard/history',leaderboards.handler(async req=>
+ leaderboards.history(await getOrCreateUserFromInitData(req),req.body)));
+app.post('/api/leaderboard/event',leaderboards.handler(async req=>
+ leaderboards.event(await getOrCreateUserFromInitData(req),req.body)));
 
 // ------------ Telegram Bot Handlers ------------
 
@@ -4788,6 +4438,7 @@ async function start() {
     await ensureSchemaOnce();
     await referralCredit.assertReady();
     await vipPass.assertReady();
+    await leaderboards.assertReady();
   } catch (err) {
     console.error("Fatal schema initialization error:", err);
     process.exit(1);
@@ -4799,6 +4450,10 @@ async function start() {
   // --- HTTP API ---
   if (mode === "api" || mode === "api+bot") {
     app.listen(PORT, () => {
+      console.log('JIGCOIN backend v12: daily/global/friends leaderboards ready');
+      leaderboards.kickFinalizer();
+      const leaderboardTimer=setInterval(()=>leaderboards.kickFinalizer(),60000);
+      leaderboardTimer.unref?.();
       console.log(`🌐 Express API running on port ${PORT} (mode=${mode})`);
     });
   } else {
