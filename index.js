@@ -20,6 +20,7 @@ const { createStreakRewards } = require("./lib/streakRewards");
 const { createGameplay } = require("./lib/gameplay");
 const { createInvite } = require("./lib/invite");
 const { createReferralCredit } = require("./lib/referralCredit");
+const referralPolicy = require("./lib/referralPolicy");
 const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
 const crypto = require("crypto");
@@ -61,20 +62,6 @@ const SPONSOR_FIXED_PAYOUTS = {
   sp_claim_reward: 200,
   sp_bonus_mission: 200,
 };
-
-// Optional: time-box the Early Access / Launch Phase FOMO without changing rewards.
-// Provide as epoch ms (e.g. 1760000000000) or ISO string (e.g. 2026-01-05T00:00:00Z).
-const EARLY_ACCESS_END_TS_RAW = String(process.env.EARLY_ACCESS_END_TS || "").trim();
-let EARLY_ACCESS_END_TS = null;
-if (EARLY_ACCESS_END_TS_RAW) {
-  const asNum = Number(EARLY_ACCESS_END_TS_RAW);
-  if (Number.isFinite(asNum) && asNum > 0) {
-    EARLY_ACCESS_END_TS = asNum;
-  } else {
-    const parsed = Date.parse(EARLY_ACCESS_END_TS_RAW);
-    if (Number.isFinite(parsed)) EARLY_ACCESS_END_TS = parsed;
-  }
-}
 
 const AUTO_MIGRATE = String(process.env.AUTO_MIGRATE || "0") === "1";
 const STRICT_REFERRAL_ACTIVATION = String(process.env.STRICT_REFERRAL_ACTIVATION || "0") === "1";
@@ -271,8 +258,8 @@ async function markStripeEventProcessed(eventId) {
   }
 }
 
-// Referral reward per new friend (once, when they join)
-const REFERRAL_REWARD = 800;
+// Starting rate; later successful invites follow referralPolicy.
+const REFERRAL_REWARD = referralPolicy.TIERS[0].reward_coins;
 
 // Cost (in points) for paid energy refill boost
 const ENERGY_REFILL_COST = 200;
@@ -288,15 +275,7 @@ const VIP_MONTH_COST = 5000;
 const VIP_MAX_ENERGY = 75;
 
 // Referral ladder (server-side tiers)
-function getReferralTier(count) {
-  const c = Number(count || 0);
-  if (c >= 200) return { tier: 5, multiplier: 2.0 };
-  if (c >= 50) return { tier: 4, multiplier: 1.6 };
-  if (c >= 20) return { tier: 3, multiplier: 1.3 };
-  if (c >= 5) return { tier: 2, multiplier: 1.15 };
-  if (c >= 1) return { tier: 1, multiplier: 1.05 };
-  return { tier: 0, multiplier: 1.0 };
-}
+function getReferralTier(count) { return referralPolicy.currentTier(count); }
 
 // Legacy fixed-day coin bonuses are replaced by the capped daily ladder.
 // Every 100th consecutive check-in adds 2,000 to the normal 2,000 reward.
@@ -549,9 +528,9 @@ const getEnergyCap = user => getEffectiveMaxEnergy(user, getStreakMetaFromUser(u
 const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
   getMultiplier: user => { const meta=getStreakMetaFromUser(user); return meta.active ? Number(meta.tap_multiplier || 1) : 1; },
   packetMax: TAP_PACKET_MAX });
-const referralCredit = createReferralCredit({pool,withTransaction,getReferralTier,baseReward:REFERRAL_REWARD,
+const referralCredit = createReferralCredit({pool,withTransaction,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
-const invite = createInvite({pool,getReferralTier,baseReward:REFERRAL_REWARD,botUsername:BOT_USERNAME,
+const invite = createInvite({pool,botUsername:BOT_USERNAME,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
@@ -586,35 +565,15 @@ app.post("/telegram/stars-webhook", starsShop.webhook, async (req,res) => {
   catch (_) { return res.status(503).json({ok:false}); }
 });
 
-// ------------ Public stats (for Early Access announcements) ------------
-// Used by the frontend to show a blocking welcome announcement until the first 1,000 users.
-// Safe to be public: returns only aggregate counts.
+// Public aggregate stats; permanent welcome policy has no countdown or cap.
 app.get("/api/stats", async (_req, res) => {
   try {
-    const totalRes = await pool.query(`SELECT COUNT(*)::int AS c FROM public.users;`);
-    const totalUsers = Number(totalRes.rows?.[0]?.c || 0);
-
-    const limit = Number(process.env.EARLY_ACCESS_CAP || 1000);
-    const issuedRes = await pool.query(`SELECT COUNT(*)::int AS n FROM public.event_log WHERE event = 'early_access_starter_bonus';`);
-    const issued = Number(issuedRes.rows?.[0]?.n || 0);
-    const remaining = Math.max(0, limit - issued);
-    const now = Date.now();
-    const endsAt = EARLY_ACCESS_END_TS ? Number(EARLY_ACCESS_END_TS) : null;
-    const endsIn = endsAt ? Math.max(0, Math.floor((endsAt - now) / 1000)) : null;
-    const timeOk = endsAt ? now < endsAt : true;
-    return res.json({
-      ok: true,
-      total_users: totalUsers,
-      early_bonus_limit: limit,
-      early_bonus_remaining: remaining,
-      early_bonus_active: issued < limit && timeOk,
-      early_bonus_ends_at: endsAt ? new Date(endsAt).toISOString() : null,
-      early_bonus_ends_in: endsIn,
-      invite_bonus: REFERRAL_REWARD,
-    });
-  } catch (e) {
-    return res.status(200).json({ ok: false, error: "STATS_FAILED" });
-  }
+    const total=await pool.query("SELECT COUNT(*)::int AS c FROM public.users");
+    return res.json({ok:true,total_users:Number(total.rows[0].c),
+      welcome_bonus:referralPolicy.WELCOME_COINS,welcome_bonus_permanent:true,
+      early_bonus_active:false,early_bonus_limit:0,early_bonus_remaining:0,
+      early_bonus_ends_at:null,early_bonus_ends_in:null,invite_bonus:REFERRAL_REWARD});
+  } catch (_) { return res.json({ok:false,error:"STATS_FAILED"}); }
 });
 
 // Basic abuse guard + device tracking
@@ -2095,90 +2054,6 @@ async function getOrCreateUserFromInitData(req) {
   return referralCredit.settle(user);
 }
 
-
-// -------------------------
-// Early Access starter bonus
-// -------------------------
-// First N users (by created_at, then id) get a one-time starter bonus.
-// Idempotency: event_log row with event='early_access_starter_bonus'.
-// Concurrency safety: pg_advisory_xact_lock.
-async function maybeAwardEarlyAccessStarterBonus(client, user) {
-  const CAP = Number(process.env.EARLY_ACCESS_CAP || 1000);
-  const BONUS = Number(process.env.EARLY_ACCESS_STARTER_BONUS || 5000);
-
-  // Require a valid user id
-  const userId = user && user.id ? user.id : null;
-  if (!userId) return { awarded: false, reason: "no_user_id" };
-
-  // Optional time window
-  const now = Date.now();
-  const endsAt = EARLY_ACCESS_END_TS ? Number(EARLY_ACCESS_END_TS) : null;
-  const timeOk = endsAt ? now < endsAt : true;
-  if (!timeOk) return { awarded: false, reason: "window_ended" };
-
-  const lockKey = 987654321; // global lock so only one award decision runs at a time
-
-  await client.query("BEGIN");
-  try {
-    // Hold the lock for the whole transaction
-    await client.query("SELECT pg_advisory_xact_lock($1)", [lockKey]);
-
-    // If already awarded for this user, do nothing
-    const already = await client.query(
-      "SELECT 1 FROM public.event_log WHERE user_id = $1 AND event = 'early_access_starter_bonus' LIMIT 1",
-      [userId]
-    );
-    if (already.rowCount > 0) {
-      await client.query("COMMIT");
-      return { awarded: false, reason: "already_awarded" };
-    }
-
-    // Count how many have been awarded so far (after lock)
-    const issued = await client.query(
-      "SELECT COUNT(*)::int AS n FROM public.event_log WHERE event = 'early_access_starter_bonus'"
-    );
-    const issued_before = Number(issued.rows?.[0]?.n ?? 0);
-
-    // Enforce cap strictly
-    if (issued_before >= CAP) {
-      await client.query("COMMIT");
-      return { awarded: false, reason: "cap_reached" };
-    }
-
-    const slot = issued_before + 1; // 1..CAP (the user's early access rank)
-
-    // Apply award + audit log
-    const beforeRes = await client.query("SELECT balance FROM public.users WHERE id = $1", [userId]);
-    const before = Number(beforeRes.rows?.[0]?.balance ?? 0);
-
-    const delta = BONUS;
-
-    await applyBalanceChangeTx(client, {
-      userId,
-      delta,
-      reason: "early_access_starter_bonus",
-      refType: "early_access",
-      refId: slot,
-      eventType: "bonus",
-    });
-
-    const after = before + delta;
-
-    await client.query(
-      `INSERT INTO public.event_log (user_id, event, meta, created_at)
-       VALUES ($1, 'early_access_starter_bonus',
-         jsonb_build_object('slot', $2, 'cap', $3, 'amount', $4, 'before', $5, 'after', $6, 'issued_before', $7),
-         NOW())`,
-      [userId, slot, CAP, BONUS, before, after, issued_before]
-    );
-
-    await client.query("COMMIT");
-    return { awarded: true, amount: BONUS, slot, cap: CAP, balance_after: after };
-  } catch (e) {
-    await client.query("ROLLBACK");
-    throw e;
-  }
-}
 
 async function logEvent(userId, event, meta = null) {
   try {
@@ -4576,11 +4451,11 @@ app.post("/api/referral/status", async (req, res) => {
     // thresholds used for progress bar on the client
     const thresholds = [0, 1, 5, 20, 50, 200];
     const idxLevel = thresholds.findIndex((t) => totalInvites < t);
-    const nextAt = idxLevel === -1 ? thresholds[thresholds.length - 1] : thresholds[idxLevel];
-    const prevAt = idxLevel <= 0 ? 0 : thresholds[idxLevel - 1];
+    const nextAt = idxLevel === -1 ? null : thresholds[idxLevel];
+    const prevAt = idxLevel === -1 ? 200 : idxLevel <= 0 ? 0 : thresholds[idxLevel - 1];
 
     const tierNames = {
-      0: "No tier yet",
+      0: "Get started",
       1: "Bronze",
       2: "Silver",
       3: "Gold",
@@ -4597,6 +4472,7 @@ app.post("/api/referral/status", async (req, res) => {
       next_at: nextAt,
       prev_at: prevAt,
       multiplier: tierInfo.multiplier,
+      reward_coins: referralPolicy.nextReward(totalInvites),
     });
   } catch (err) {
     console.error("Error /api/referral/status:", err);
@@ -4620,6 +4496,7 @@ async function buildReferralSummary(user) {
     totalPoints,
     currentTier: tierInfo.tier,
     multiplier: tierInfo.multiplier,
+    reward_coins: referralPolicy.nextReward(totalInvites),
     nextTarget: next,
     nextRemaining: next ? Math.max(0, next - totalInvites) : 0,
   };
@@ -5298,13 +5175,15 @@ bot.start(async (ctx) => {
     await referralCredit.settle(user);
 
     await ctx.reply(
-      "🚀 Early access is live.\nStart farming now 👇",
+      user.welcome_bonus_awarded === 1000
+        ? "Welcome to JigCoin! Your 1,000 welcome coins are ready. Open the app and start tapping."
+        : "Welcome back to JigCoin. Open the app, collect your daily reward and keep building your coins.",
       {
         reply_markup: {
           inline_keyboard: [
             [
               {
-                text: "🚀 Start Farming",
+                text: "Open JigCoin",
                 web_app: {
                   url: "https://jigcoin-frontend.pages.dev",
                 },
