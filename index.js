@@ -25,6 +25,7 @@ const { createRecoveryTestAccess } = require("./lib/recoveryTestAccess");
 const { createStarsShop, telegramClient } = require("./lib/starsShop");
 const {createVipPass} = require("./lib/vipPass");
 const {benefits:vipBenefits} = require("./lib/vipPolicy");
+const {createWeeklyRace} = require("./lib/weeklyRace");
 const {createLeaderboards} = require("./lib/leaderboards");
 const {createReleaseAccess,cohortMiddleware}=require("./lib/releaseAccess");
 const {createReleaseJourney}=require("./lib/releaseJourney");
@@ -533,12 +534,13 @@ const referralCredit = createReferralCredit({pool,withTransaction,journey,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const invite = createInvite({pool,botUsername:BOT_USERNAME,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
-const monetagRewards = createMonetagRewards({ journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
+const weeklyRace = createWeeklyRace({pool, withTransaction});
+const monetagRewards = createMonetagRewards({ pilot:weeklyRace, journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
 const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS,restoreEnabled:streakRestore.enabled});
 const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS,streakRewards});
-const leaderboards=createLeaderboards({pool,streakRewards});
+const leaderboards=createLeaderboards({pool,streakRewards,pilot:weeklyRace});
 const vipPass = createVipPass({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env),getStreakMeta:getStreakMetaFromUser});
 const starsShop = createStarsShop({vipPass,streakRestore,pool,withTransaction,applyBalanceChangeTx,env:process.env,streakMilestones:STREAK_BONUS,callTelegram:telegramClient(process.env)});
 
@@ -616,7 +618,7 @@ for(const [path,service] of [["/api/admin/stars/refund",starsShop],["/api/admin/
 }
 app.use(cohortMiddleware({env:process.env,verifyTelegramInitData}));
 // Optional single-account ad test; all other requests still reach maintenance.
-app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
+app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction, pilot:weeklyRace,
   applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards }));
 
 // Global maintenance-mode guard for mutating endpoints.
@@ -642,6 +644,17 @@ app.use((req, res, next) => {
   });
 });
 
+
+// The pilot uses the same signed Telegram identity and maintenance boundary as gameplay.
+for (const [route, action] of Object.entries({
+  '/api/pilot/profile': user => weeklyRace.profile(user),
+  '/api/pilot/coin': (user, body) => weeklyRace.profile(user, body.equip),
+  '/api/weekly/standings': (user, body) => weeklyRace.standings(user, body),
+  '/api/weekly/start': (user, body) => weeklyRace.start(user, body),
+  '/api/weekly/answer': (user, body) => weeklyRace.answer(user, body)
+})) {
+  app.post(route, leaderboards.handler(async req => action(await getOrCreateUserFromInitData(req), req.body)));
+}
 
 // Ordinary-account Stars routes use the same ledger as the owner path.
 app.post('/api/stars/catalog',starsShop.handler(async req=>starsShop.catalog(await getOrCreateUserFromInitData(req))));
@@ -4416,6 +4429,7 @@ async function start() {
     await vipPass.assertReady();
     await leaderboards.assertReady();
     await journey.assertReady();
+    if (process.env.JIGCOIN_INSTALL_PILOT_SCHEMA === '1') await weeklyRace.prepare();
   } catch (err) {
     console.error("Fatal schema initialization error:", err);
     process.exit(1);
@@ -4426,7 +4440,7 @@ async function start() {
   // --- HTTP API ---
   if (mode === "api" || mode === "api+bot") {
     app.listen(PORT, () => {
-      console.log('JIGCOIN backend v13: checkout, introduction and journey tracking ready');
+      console.log('JIGCOIN backend v14 ready');
       leaderboards.kickFinalizer();
       const leaderboardTimer=setInterval(()=>leaderboards.kickFinalizer(),60000);
       leaderboardTimer.unref?.();
