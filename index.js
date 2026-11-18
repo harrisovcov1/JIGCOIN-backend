@@ -26,6 +26,8 @@ const { createStarsShop, telegramClient } = require("./lib/starsShop");
 const {createVipPass} = require("./lib/vipPass");
 const {benefits:vipBenefits} = require("./lib/vipPolicy");
 const {createLeaderboards} = require("./lib/leaderboards");
+const {createReleaseAccess,cohortMiddleware}=require("./lib/releaseAccess");
+const {createReleaseJourney}=require("./lib/releaseJourney");
 const crypto = require("crypto");
 const Stripe = require("stripe");
 const fetch = require("node-fetch");
@@ -68,7 +70,6 @@ const SPONSOR_FIXED_PAYOUTS = {
 
 const AUTO_MIGRATE = String(process.env.AUTO_MIGRATE || "0") === "1";
 const STRICT_REFERRAL_ACTIVATION = String(process.env.STRICT_REFERRAL_ACTIVATION || "0") === "1";
-const ONBOARDING_MIN_REFERRALS = Number(process.env.ONBOARDING_MIN_REFERRALS || 1);
 const REFERRAL_ACTIVATION_MIN_TAPS = Number(process.env.REFERRAL_ACTIVATION_MIN_TAPS || 150);
 const REFERRAL_ACTIVATION_MIN_SPONSOR = Number(process.env.REFERRAL_ACTIVATION_MIN_SPONSOR || 1);
 const TAP_PACKET_MAX = Number(process.env.TAP_PACKET_MAX || 25);
@@ -522,15 +523,17 @@ async function fulfillStreakRestoreByTelegramId({ telegramId, sku, provider, pro
 // ------------ Bot & Express Setup ------------
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
+const releaseAccess=createReleaseAccess(process.env);
+const journey=createReleaseJourney({pool,withTransaction,env:process.env});
 const getEnergyCap = (user,now=Date.now()) => getEffectiveMaxEnergy(user, getStreakMetaFromUser(user,now),now);
-const gameplay = createGameplay({ pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
+const gameplay = createGameplay({ journey, pool, withTransaction, applyBalanceChangeTx, getEnergyCap,
   getMultiplier: (user,now) => { const meta=getStreakMetaFromUser(user,now); return meta.active ? Number(meta.tap_multiplier || 1) : 1; },
   packetMax: TAP_PACKET_MAX });
-const referralCredit = createReferralCredit({pool,withTransaction,
+const referralCredit = createReferralCredit({pool,withTransaction,journey,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const invite = createInvite({pool,botUsername:BOT_USERNAME,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
-const monetagRewards = createMonetagRewards({ pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
+const monetagRewards = createMonetagRewards({ journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
 const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS,restoreEnabled:streakRestore.enabled});
@@ -559,8 +562,8 @@ app.get("/postback/monetag", monetagRewards.handler(req => monetagRewards.postba
 // Payment confirmations stay available during maintenance and after sales are paused.
 app.post("/telegram/stars-webhook", starsShop.webhook, async (req,res) => {
   // Enabling receipt delivery must not reopen registration during maintenance.
-  if (MAINTENANCE_MODE && !(String(process.env.RECOVERY_TEST_ENABLED) === "1" &&
-      String(req.body?.message?.from?.id) === String(process.env.RECOVERY_TEST_TELEGRAM_ID))) return res.json({ok:true});
+  const ownIdRequest=/^\/id(@\w+)?(?:\s|$)/.test(req.body?.message?.text||"");
+  if (MAINTENANCE_MODE && !ownIdRequest && !releaseAccess.admitted(req.body?.message?.from?.id)) return res.json({ok:true});
   try { await bot.handleUpdate(req.body); return res.json({ok:true}); }
   catch (_) { return res.status(503).json({ok:false}); }
 });
@@ -603,13 +606,24 @@ app.post("/api/admin/vip/refund", async (req,res) => {
   catch(e) { res.status(e.status||503).json({ok:false,error:e.code||"VIP_REFUND_FAILED"}); }
 });
 
+// Authenticated support refunds stay available when new sales are paused.
+for(const [path,service] of [["/api/admin/stars/refund",starsShop],["/api/admin/streak/refund",streakRestore]]) {
+  app.post(path,async(req,res)=>{
+    if(!requireAdmin(req,res))return;
+    try{res.json(await service.refundOrder(req.body?.order_id));}
+    catch(e){res.status(e.status||503).json({ok:false,error:e.code||"REFUND_FAILED"});}
+  });
+}
+app.use(cohortMiddleware({env:process.env,verifyTelegramInitData}));
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction,
   applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
-  if (!MAINTENANCE_MODE) return next();
+  if (!MAINTENANCE_MODE || req.releaseCohortAllowed) return next();
+  // Historical receipts retain their own provider signature checks below.
+  if(req.method==="POST"&&["/api/stripe/webhook","/api/coinbase/webhook"].includes(req.path))return next();
 
   // Allow health and basic status endpoints even in maintenance.
   const p = req.path || "";
@@ -628,6 +642,16 @@ app.use((req, res, next) => {
   });
 });
 
+
+// Ordinary-account Stars routes use the same ledger as the owner path.
+app.post('/api/stars/catalog',starsShop.handler(async req=>starsShop.catalog(await getOrCreateUserFromInitData(req))));
+app.post('/api/stars/catalog-preview',starsShop.handler(async req=>starsShop.catalog(await getOrCreateUserFromInitData(req),{preview:true})));
+app.post('/api/stars/invoice',starsShop.handler(async req=>starsShop.invoice(await getOrCreateUserFromInitData(req),req.body.sku)));
+app.post('/api/stars/status',starsShop.handler(async req=>starsShop.status(await getOrCreateUserFromInitData(req),req.body.order_id)));
+// Retire creation of legacy external digital-goods payments; historical receipts remain.
+for(const path of ['/api/payments/create-checkout','/api/shop/coin-packs','/api/shop/momentum-shields'])
+ app.post(path,(_req,res)=>res.status(410).json({ok:false,error:'USE_TELEGRAM_STARS',packs:[]}));
+app.get('/api/shop/starter-offer',(_req,res)=>res.json({ok:true,available:false}));
 
 // Authenticated, server-counted challenges. The maintenance guard above applies.
 app.post('/api/progression',monetagRewards.handler(async req=>progression.status(await getOrCreateUserFromInitData(req))));
@@ -2124,7 +2148,8 @@ async function buildClientState(user, { readOnly = false } = {}) {
     active_powerups,
     momentum_shield_qty,
     momentum_shield_expires_at,
-    onboarding_required: user.has_completed_onboarding === false,
+    onboarding_required: user.has_completed_onboarding !== true,
+    onboarding: await journey.status(user),
   };
 }
 
@@ -2625,61 +2650,22 @@ app.post("/api/state", async (req, res) => {
   try {
     let user = await getOrCreateUserFromInitData(req);
 
-    // Project regeneration without stale read/modify/write races against taps.
+    // Record the verified app open before projecting energy.
+    user = await journey.open(user);
     user = gameplay.project(user);
 
     const state = await buildClientState(user);
     res.json(state);
   } catch (err) {
     console.error("Error /api/state:", err);
-    res.status(500).json({ ok: false, error: "STATE_ERROR" });
+    res.status(err.status||500).json({ ok: false, error: err.status===401?"UNAUTHORIZED":"STATE_ERROR" });
   }
 });
 
-app.post("/api/onboarding/complete", async (req, res) => {
-  try {
-    let user = await getOrCreateUserFromInitData(req);
-
-    const currentRefs = Number(user.referrals_count || 0);
-    const minRefs = ONBOARDING_MIN_REFERRALS;
-
-    // If onboarding is already completed in the DB, just return state.
-    if (user.has_completed_onboarding) {
-      const state = await buildClientState(user);
-      return res.json(state);
-    }
-
-    // Enforce referral-gated completion
-    if (currentRefs < minRefs) {
-      const state = await buildClientState(user);
-      return res.json({
-        ...state,
-        ok: false,
-        reason: "NEED_REFERRAL",
-        onboarding_required: true,
-      });
-    }
-
-    const client = await pool.connect();
-    try {
-      const result = await client.query(
-        "UPDATE public.users SET has_completed_onboarding = TRUE WHERE id = $1 RETURNING *",
-        [user.id]
-      );
-      if (result.rows && result.rows[0]) {
-        user = result.rows[0];
-      }
-    } finally {
-      client.release();
-    }
-
-    const state = await buildClientState(user);
-    return res.json(state);
-  } catch (err) {
-    console.error("Error /api/onboarding/complete:", err);
-    return res.status(500).json({ ok: false, error: "ONBOARDING_COMPLETE_ERROR" });
-  }
-});
+app.post("/api/onboarding/complete", starsShop.handler(async req=> {
+  const user=await getOrCreateUserFromInitData(req);
+  return buildClientState(await journey.complete(user));
+}));
 app.get("/api/state-debug", async (req, res) => {
   try {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
@@ -3896,6 +3882,7 @@ async function handleDailyCheckin(req, res, verifiedTester = null) {
       await streakRewards.grant(client,user.id,newStreak);
       await client.query(`INSERT INTO public.streak_events(user_id,telegram_id,event,meta)
         VALUES($1,$2,'checkin',$3::jsonb)`,[user.id,user.telegram_id,JSON.stringify({streak:newStreak,base:payout.base,bonus,reward:totalReward,policy:STREAK_ECONOMY.version,shield_used:!!shield})]);
+      await journey.touchTx(client,user,"daily");
       await completeIdempotencyKeyTx(client,{endpoint,requestId,context,responsePayload:null});
       credited=true;
     });
@@ -3910,20 +3897,6 @@ async function handleDailyCheckin(req, res, verifiedTester = null) {
     const upd = await pool.query(`SELECT * FROM public.users WHERE id = $1`, [user.id]);
     user = upd.rows[0];
     const meta = getStreakMetaFromUser(user);
-
-    // Starter Bundle onboarding: start a 7-day window the first time a user successfully claims the daily bonus.
-    if (!user.starter_offer_purchased && !user.starter_offer_expires_at) {
-      const { rows: starterRows } = await pool.query(
-        `
-        UPDATE public.users
-        SET starter_offer_expires_at = NOW() + interval '7 days'
-        WHERE id = $1
-        RETURNING *;
-        `,
-        [user.id]
-      );
-      if (starterRows && starterRows[0]) user = starterRows[0];
-    }
 
     const nextAt = startOfUtcDay(utcDayString(new Date(Date.now() + 24*60*60*1000))).toISOString();
     const state = await dailyState(user);
@@ -4359,10 +4332,13 @@ app.post('/api/leaderboard/event',leaderboards.handler(async req=>
 
 // ------------ Telegram Bot Handlers ------------
 
+// An ordinary tester can obtain their own ID without an external lookup bot.
+bot.command("id", async ctx=>ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
+
 // /start – handle possible referral
 bot.start(async (ctx) => {
   try {
-    if (MAINTENANCE_MODE) {
+    if (MAINTENANCE_MODE && !releaseAccess.admitted(ctx.from?.id)) {
       await ctx.reply("JigCoin is being updated. Please try again shortly.");
       return;
     }
@@ -4432,25 +4408,25 @@ bot.command("referral", async (ctx) => {
 
 // ------------ Launch (with 409-safe bot startup) ------------
 async function start() {
-  const PORT = process.env.PORT || 300
+  const PORT = process.env.PORT || 3000;
   // Ensure Supabase schema is ready before accepting traffic.
   try {
     await ensureSchemaOnce();
     await referralCredit.assertReady();
     await vipPass.assertReady();
     await leaderboards.assertReady();
+    await journey.assertReady();
   } catch (err) {
     console.error("Fatal schema initialization error:", err);
     process.exit(1);
   }
 
-0;
   const mode = RUN_MODE || "api+bot";
 
   // --- HTTP API ---
   if (mode === "api" || mode === "api+bot") {
     app.listen(PORT, () => {
-      console.log('JIGCOIN backend v12: daily/global/friends leaderboards ready');
+      console.log('JIGCOIN backend v13: checkout, introduction and journey tracking ready');
       leaderboards.kickFinalizer();
       const leaderboardTimer=setInterval(()=>leaderboards.kickFinalizer(),60000);
       leaderboardTimer.unref?.();

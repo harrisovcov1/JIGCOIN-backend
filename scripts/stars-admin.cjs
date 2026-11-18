@@ -4,17 +4,20 @@ const {pool,withTransaction}=require('../lib/db');
 const {applyBalanceChangeTx}=require('../lib/ledger');
 const {createStarsShop,telegramClient}=require('../lib/starsShop');
 const {createStreakRestore}=require('../lib/streakRestore');
+const {createVipPass}=require('../lib/vipPass');
 const env=process.env,callTelegram=telegramClient(env);
 const shop=createStarsShop({pool,withTransaction,applyBalanceChangeTx,env,callTelegram});
 const restore=createStreakRestore({pool,withTransaction,env,callTelegram});
+const vip=createVipPass({pool,withTransaction,env,callTelegram});
+const yes=v=>/^(1|true)$/i.test(String(v||''));
 async function main(){
  const [command,payload,confirm]=process.argv.slice(2);
  if(command==='status'){
   const bot=await callTelegram('getMe',{}),hook=await callTelegram('getWebhookInfo',{});
   const schema=await pool.query("SELECT to_regclass('jigcoin_internal.stars_orders') IS NOT NULL AS installed");
-  console.log(JSON.stringify({bot_username:bot.username,sales_enabled:shop.ready(),schema_installed:schema.rows[0].installed,
+  console.log(JSON.stringify({bot_username:bot.username,stars_configured:shop.ready(),coin_public_sales_enabled:yes(env.COIN_PUBLIC_SALES_ENABLED),vip_public_sales_enabled:yes(env.VIP_PUBLIC_SALES_ENABLED),maintenance:yes(env.MAINTENANCE_MODE),release_cohort_enabled:yes(env.RELEASE_COHORT_ENABLED),schema_installed:schema.rows[0].installed,
     webhook_matches:hook.url===env.STARS_WEBHOOK_URL,pending_updates:hook.pending_update_count,allowed_updates:hook.allowed_updates,
-    has_webhook_error:Boolean(hook.last_error_date),private_tester_only:true},null,2));return;
+    has_webhook_error:Boolean(hook.last_error_date)},null,2));return;
  }
  if(command==='configure-webhook'){
   if(!/^[A-Za-z0-9_-]{32,256}$/.test(env.TELEGRAM_WEBHOOK_SECRET||''))throw Error('Set TELEGRAM_WEBHOOK_SECRET to 32-256 allowed characters first.');
@@ -29,7 +32,7 @@ async function main(){
   console.log('Webhook configured and verified. Sales flag was not changed.');return;
  }
  if(command==='refund' && confirm==='--confirm-refund'){
-  console.log(JSON.stringify(await (restore.matches(payload)?restore:shop).refundOrder(payload)));return;
+  console.log(JSON.stringify(await (vip.matches(payload)?vip:restore.matches(payload)?restore:shop).refundOrder(payload)));return;
  }
  throw Error('Usage: node scripts/stars-admin.cjs status | configure-webhook | refund ORDER_REFERENCE --confirm-refund');
 }
