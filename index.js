@@ -4429,7 +4429,10 @@ async function start() {
     await vipPass.assertReady();
     await leaderboards.assertReady();
     await journey.assertReady();
-    if (process.env.JIGCOIN_INSTALL_PILOT_SCHEMA === '1') await weeklyRace.prepare();
+    if (process.env.JIGCOIN_INSTALL_PILOT_SCHEMA === '1') {
+      await weeklyRace.prepareRelease();
+      console.log('JIGCOIN weekly races and Mint result cards ready (024/025)');
+    }
   } catch (err) {
     console.error("Fatal schema initialization error:", err);
     process.exit(1);

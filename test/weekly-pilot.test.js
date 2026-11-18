@@ -75,7 +75,9 @@ integration('a missing schema closes new placements; explicit additive installat
   const manual = makePilot({});
   assert.equal(await manual.refillAvailable(players[0]),false);
   await assert.rejects(() => manual.profile(players[0]),{status:503});
-  await Promise.all([pilot.prepare(),pilot.prepare()]);
+  await Promise.all([pilot.prepareRelease(),pilot.prepareRelease()]);
+  const {rows:[schema]} = await pool.query("SELECT to_regclass('jigcoin_internal.weekly_result_cards') IS NOT NULL AS ready");
+  assert.equal(schema.ready,true);
   await pool.query(readFileSync(path.join(__dirname,'../sql/migrations/024_revenue_pilot.sql'),'utf8'));
   const privileges = await pool.query("SELECT has_table_privilege('anon','jigcoin_internal.weekly_runs_v14','SELECT') AS exposed");
   assert.equal(privileges.rows[0].exposed,false);
