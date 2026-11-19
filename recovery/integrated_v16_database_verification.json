@@ -1,0 +1,128 @@
+{
+  "release": "JigCoin integrated v16",
+  "scope": "Read-only production database gate after both migrations, before backend deployment",
+  "verification_query": "recovery/verify_integrated_v16.sql",
+  "migrations": [
+    "20261119172826_referral_cumulative_activation.sql",
+    "20261119172851_weekly_daily_runs_and_awards.sql"
+  ],
+  "database": {
+    "ready": true,
+    "passed": 183,
+    "warnings": [],
+    "checked_at": "2026-11-19T18:23:13.767839+00:00",
+    "baseline_at": "2026-11-19T18:01:03.623565+00:00",
+    "total_checks": 183,
+    "run_backfills": {
+      "runs": 3,
+      "wrong_week": 0,
+      "wrong_policy": 0,
+      "baseline_runs": 3,
+      "legacy_vip_inferred": 0,
+      "wrong_allowance_day": 0,
+      "newer_wrong_rank_finish": 0,
+      "baseline_wrong_rank_finish": 0,
+      "newer_missing_request_keys": 0,
+      "baseline_missing_request_keys": 0
+    },
+    "blocking_findings": [],
+    "historical_import": {
+      "expected_weeks": 0,
+      "imported_weeks": 0,
+      "expected_awards": 0,
+      "imported_awards": 0,
+      "incorrect_weeks": 0,
+      "award_set_difference": 0
+    },
+    "retained_referrals": {
+      "markers": [
+        "referral_credit_v9",
+        "referrals_cumulative_v16",
+        "referrals_welcome_v10"
+      ],
+      "referrals": 19,
+      "v9_contracts": 0,
+      "v10_contracts": 0,
+      "v16_contracts": 0,
+      "welcome_credits": 0
+    }
+  },
+  "security_advisors": {
+    "observed_at": "2026-11-19T18:23:14.124Z",
+    "baseline": {
+      "rls_enabled_no_policy": {
+        "level": "INFO",
+        "count": 85
+      },
+      "function_search_path_mutable": {
+        "level": "WARN",
+        "count": 31
+      }
+    },
+    "current": {
+      "rls_enabled_no_policy": {
+        "level": "INFO",
+        "count": 91
+      },
+      "function_search_path_mutable": {
+        "level": "WARN",
+        "count": 31
+      }
+    },
+    "errors": 0,
+    "added_warning_or_error_count": 0,
+    "removed_finding_count": 0,
+    "changes_match_expected_six_private_tables": true,
+    "added_information": [
+      {
+        "code": "rls_enabled_no_policy",
+        "level": "INFO",
+        "schema": "jigcoin_internal",
+        "table": "referral_credits_v16"
+      },
+      {
+        "code": "rls_enabled_no_policy",
+        "level": "INFO",
+        "schema": "jigcoin_internal",
+        "table": "weekly_awards_v16"
+      },
+      {
+        "code": "rls_enabled_no_policy",
+        "level": "INFO",
+        "schema": "jigcoin_internal",
+        "table": "weekly_finalizations_v16"
+      },
+      {
+        "code": "rls_enabled_no_policy",
+        "level": "INFO",
+        "schema": "jigcoin_internal",
+        "table": "weekly_practice_runs_v16"
+      },
+      {
+        "code": "rls_enabled_no_policy",
+        "level": "INFO",
+        "schema": "jigcoin_internal",
+        "table": "weekly_run_requests_v16"
+      },
+      {
+        "code": "rls_enabled_no_policy",
+        "level": "INFO",
+        "schema": "jigcoin_internal",
+        "table": "weekly_upgrade_v16"
+      }
+    ],
+    "explanation": "The six added informational findings are the intended private tables with RLS enabled and no browser policies; exact role grants and denied browser access passed the SQL verifier. All 31 prior mutable-search-path warnings are unchanged; neither new function adds a warning.",
+    "remediation_urls": [
+      "https://supabase.com/docs/guides/database/database-linter?lint=0008_rls_enabled_no_policy",
+      "https://supabase.com/docs/guides/database/database-linter?lint=0011_function_search_path_mutable"
+    ]
+  },
+  "ready_for_backend_deployment": true,
+  "remaining_deployment_checks": [
+    "Confirm backend prepareRelease completes and service becomes healthy.",
+    "Confirm authenticated standings retain weekly-v14 until the 2026-11-23 00:00 UTC cutover.",
+    "Confirm separate practice endpoint advances a puzzle without consuming ranked quota or updating ranked score.",
+    "Confirm the deployed frontend reaches the upgraded backend and renders the approved mobile layout."
+  ],
+  "production_mutations_performed_by_verifier": false
+}
