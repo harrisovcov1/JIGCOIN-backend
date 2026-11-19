@@ -17,6 +17,7 @@ const { createMonetagRewards } = require("./lib/monetagRewards");
 const { createProgression } = require("./lib/progression");
 const {dailyRewardBreakdown,restorePolicy,STREAK_ECONOMY} = require("./lib/streakPolicy");
 const {createStreakRestore} = require("./lib/streakRestore");
+const {createStreakReminder} = require("./lib/streakReminder");
 const { createStreakRewards } = require("./lib/streakRewards");
 const { createGameplay } = require("./lib/gameplay");
 const { createInvite } = require("./lib/invite");
@@ -539,6 +540,8 @@ const weeklyRace = createWeeklyRace({pool, withTransaction});
 const monetagRewards = createMonetagRewards({ pilot:weeklyRace, journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
 
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
+const streakReminder = createStreakReminder({pool,withTransaction,callTelegram:telegramClient(process.env),
+  botUsername:BOT_USERNAME,mayDeliver:id=>!MAINTENANCE_MODE || releaseAccess.admitted(id)});
 const streakRewards = createStreakRewards({pool,baseReward:DAILY_CHECKIN_REWARD,milestones:STREAK_BONUS,tiers:STREAK_TIERS,restoreEnabled:streakRestore.enabled});
 const progression = createProgression({pool,withTransaction,applyBalanceChangeTx,streakMilestones:STREAK_BONUS,streakRewards});
 const leaderboards=createLeaderboards({pool,streakRewards,pilot:weeklyRace});
@@ -567,7 +570,11 @@ app.post("/telegram/stars-webhook", starsShop.webhook, async (req,res) => {
   // Enabling receipt delivery must not reopen registration during maintenance.
   const ownIdRequest=/^\/id(@\w+)?(?:\s|$)/.test(req.body?.message?.text||"");
   if (MAINTENANCE_MODE && !ownIdRequest && !releaseAccess.admitted(req.body?.message?.from?.id)) return res.json({ok:true});
-  try { await bot.handleUpdate(req.body); return res.json({ok:true}); }
+  try {
+    if (req.body?.message?.write_access_allowed) await streakReminder.recordWriteAccess(req.body.message);
+    else await bot.handleUpdate(req.body);
+    return res.json({ok:true});
+  }
   catch (_) { return res.status(503).json({ok:false}); }
 });
 
@@ -602,6 +609,36 @@ app.use(async (req, res, next) => {
   } catch (e) {}
   next();
 });
+
+// These endpoints only read an existing signed-in account. Keep cancellation accessible even
+// when gameplay is paused. Admission is checked by the reminder service for each new request.
+for (const action of ['status','set']) {
+  app.post('/api/streak/reminder/'+action,async(req,res)=>{
+    res.set('Cache-Control','no-store');
+    try {
+      const raw=req.body?.initData || req.headers['x-telegram-initdata'];
+      const token=String(process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
+      if (!verifyTelegramInitData(raw,token).ok) return res.status(401).json({ok:false,error:'UNAUTHORIZED'});
+      const params=new URLSearchParams(raw);
+      const identity=JSON.parse(params.get('user')||'null');
+      if (!Number.isSafeInteger(identity?.id) || identity.id<=0 || identity.is_bot)
+        return res.status(401).json({ok:false,error:'UNAUTHORIZED'});
+      if (action==='set' && req.body.enabled===true && MAINTENANCE_MODE &&
+          (!releaseAccess.admitted(identity.id) || Date.now()/1000-Number(params.get('auth_date'))>3600))
+        return res.status(503).json({ok:false,error:'MAINTENANCE_MODE'});
+      const {rows:[user]}=await pool.query('SELECT id,telegram_id FROM public.users WHERE telegram_id=$1',[identity.id]);
+      if (!user) {
+        if (action==='status' || req.body.enabled===false) return res.json({ok:true,reminder:null});
+        return res.status(409).json({ok:false,error:'REMINDER_CLAIM_FIRST'});
+      }
+      const result=action==='status' ? await streakReminder.status(user)
+        : await streakReminder.set(user,req.body,identity.allows_write_to_pm===true);
+      return res.json(result);
+    } catch (error) {
+      return res.status(error.status||503).json({ok:false,error:error.status?error.code:'REMINDER_UNAVAILABLE'});
+    }
+  });
+}
 
 app.post("/api/admin/vip/refund", async (req,res) => {
   if (!requireAdmin(req,res)) return;
@@ -4324,6 +4361,9 @@ app.post('/api/leaderboard/event',leaderboards.handler(async req=>
 
 // ------------ Telegram Bot Handlers ------------
 
+// Accepted only from authenticated Telegram webhook delivery or bot polling.
+bot.on('write_access_allowed',ctx=>streakReminder.recordWriteAccess(ctx.message));
+
 // An ordinary tester can obtain their own ID without an external lookup bot.
 bot.command("id", async ctx=>ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
 
@@ -4408,6 +4448,7 @@ async function start() {
     await vipPass.assertReady();
     await leaderboards.assertReady();
     await journey.assertReady();
+    await streakReminder.prepare();
     if (process.env.JIGCOIN_INSTALL_PILOT_SCHEMA === '1') {
       await weeklyRace.prepareRelease();
       console.log('JIGCOIN weekly races and Mint result cards ready (024/025)');
@@ -4426,6 +4467,10 @@ async function start() {
       leaderboards.kickFinalizer();
       const leaderboardTimer=setInterval(()=>leaderboards.kickFinalizer(),60000);
       leaderboardTimer.unref?.();
+      const deliverReminders=()=>streakReminder.dispatch().catch(()=>console.error('Daily reminder delivery unavailable'));
+      deliverReminders();
+      const reminderTimer=setInterval(deliverReminders,15000);
+      reminderTimer.unref?.();
       console.log(`🌐 Express API running on port ${PORT} (mode=${mode})`);
     });
   } else {

@@ -17,7 +17,7 @@ async function startIsolatedApp(t, maintenance, options = {}) {
   const dependencies = {
     express: Object.assign(() => app, express),
     cors: require("cors"),
-    telegraf: { Telegraf: class { start() {} command() {} } },
+    telegraf: { Telegraf: class { start() {} command() {} on() {} } },
     "./lib/db": { pool, withTransaction: options.withTransaction || (async () => { throw Error("Unexpected transaction"); }) },
     "./lib/ledger": options.ledger || {},
     "./lib/jobs": {},
