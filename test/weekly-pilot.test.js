@@ -179,6 +179,7 @@ integration('verified v13 coin awards survive retirement; low-energy refill cred
   const previous = readFileSync(path.join(dir,'023_release_readiness_v13.sql'),'utf8');
   const from = previous.indexOf('DO $$ DECLARE definition text;');
   await pool.query(previous.slice(from,previous.indexOf('END $$;',from)+7));
+  await pool.query(readFileSync(path.join(dir,'20261119152941_refill_policy_trial.sql'),'utf8'));
   const mockSettings = {MONETAG_REWARDS_ENABLED:'1',MONETAG_ZONE_ID:'123',MONETAG_POSTBACK_SECRET:'a'.repeat(32)};
   const oldService = createMonetagRewards({pool,withTransaction:transaction,applyBalanceChangeTx,env:mockSettings});
   const current = createMonetagRewards({pool,withTransaction:transaction,applyBalanceChangeTx,env:mockSettings,pilot});
@@ -195,9 +196,9 @@ integration('verified v13 coin awards survive retirement; low-energy refill cred
   assert.equal(credits.filter(x=>x.already_claimed).length,1);
   await pool.query("UPDATE public.users SET energy=2,last_energy_ts=clock_timestamp()-interval '10 minutes' WHERE id=$1",[user.id]);
   await assert.rejects(()=>current.start(user,refill),{code:'ENERGY_FULL'});
-  await pool.query('UPDATE public.users SET energy=11,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
+  await pool.query('UPDATE public.users SET energy=21,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
   await assert.rejects(()=>current.start(user,refill),{code:'ENERGY_ABOVE_REFILL_THRESHOLD'});
-  await pool.query('UPDATE public.users SET energy=10,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
+  await pool.query('UPDATE public.users SET energy=20,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
   const attempt=await current.start(user,refill);
   await assert.rejects(()=>current.claim(user,refill,attempt.ymid),{code:'AD_CONFIRMATION_PENDING'});
   await confirm(attempt);
