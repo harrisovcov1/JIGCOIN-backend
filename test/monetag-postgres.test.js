@@ -49,6 +49,7 @@ before(async () => {
       status text,started_at timestamptz,completed_at timestamptz,verified_at timestamptz,claimed_at timestamptz,reward_applied boolean,
       UNIQUE(user_id,mission_id));
     CREATE TABLE public.user_balance_ledger (id bigserial PRIMARY KEY,user_id integer REFERENCES public.users(id),delta bigint,reason text,ref_type text,ref_id bigint,event_type text);
+    CREATE TABLE public.event_log(id bigserial PRIMARY KEY,user_id bigint REFERENCES public.users(id),event text,meta jsonb,created_at timestamptz DEFAULT clock_timestamp());
     DO $$ BEGIN PERFORM pg_advisory_xact_lock(14142025); IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon; END IF;
       IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated; END IF; END $$;
   `);
@@ -64,7 +65,8 @@ before(async () => {
     CREATE TABLE jigcoin_internal.tap_fraction(user_id bigint PRIMARY KEY REFERENCES public.users,units integer NOT NULL);
     CREATE TABLE jigcoin_internal.vip_tap_stats_v11(user_id bigint PRIMARY KEY REFERENCES public.users,bonus_coins bigint NOT NULL,fraction_units integer NOT NULL);
     ALTER TABLE jigcoin_internal.ad_attempts DROP CONSTRAINT ad_attempts_cooldown_seconds_check;
-    ALTER TABLE jigcoin_internal.ad_attempts ADD CHECK(cooldown_seconds=86400
+    ALTER TABLE jigcoin_internal.ad_attempts ADD CONSTRAINT ad_attempts_cooldown_policy CHECK(cooldown_seconds=86400
+      OR (reward_kind IN ('energy_refill','double_10m') AND cooldown_seconds=3600)
       OR (reward_kind IN ('coins','energy_refill') AND cooldown_seconds=300)
       OR (reward_kind='double_10m' AND cooldown_seconds=1800));
     ALTER TABLE jigcoin_internal.vip_tap_stats_v11 ENABLE ROW LEVEL SECURITY;
@@ -73,6 +75,17 @@ before(async () => {
   `);
   await pool.query(`CREATE TRIGGER trg_enforce_daily_sponsor_cap BEFORE UPDATE OF claimed_at ON public.user_missions
     FOR EACH ROW EXECUTE FUNCTION public.enforce_daily_sponsor_cap()`);
+  await pool.query(`
+    DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role; END IF; END $$;
+    CREATE TABLE jigcoin_internal.acquisition_v13(user_id bigint PRIMARY KEY REFERENCES public.users(id),excluded boolean DEFAULT FALSE);
+    CREATE TABLE jigcoin_internal.pilot_players_v14(user_id bigint PRIMARY KEY REFERENCES public.users(id),ad_group text NOT NULL);
+    CREATE TABLE jigcoin_internal.purchase_receipts_v13(user_id bigint REFERENCES public.users(id),product text,stars integer,charge_id text,paid_at timestamptz,refunded_at timestamptz);
+    ALTER TABLE jigcoin_internal.acquisition_v13 ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE jigcoin_internal.pilot_players_v14 ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE jigcoin_internal.purchase_receipts_v13 ENABLE ROW LEVEL SECURITY;
+  `);
+  const refillPolicy=fs.readFileSync(path.join(__dirname,'../sql/migrations/20261119152941_refill_policy_trial.sql'),'utf8');
+  await pool.query(refillPolicy); await pool.query(refillPolicy);
 });
 beforeEach(async () => {
   if (!port) return;
@@ -249,7 +262,7 @@ pgTest("RLS blocks browser access even if schema and table grants are accidental
   const flags = (await pool.query(`SELECT relrowsecurity FROM pg_class c
     JOIN pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname='jigcoin_internal' AND c.relkind='r'`)).rows;
-  assert.equal(flags.length,6);
+  assert.equal(flags.length,12);
   assert.ok(flags.every(r=>r.relrowsecurity));
   const client=await pool.connect();
   try {
@@ -321,4 +334,199 @@ pgTest("full energy and an active double boost do not start unnecessary ads",asy
  await assert.rejects(rewards.start(user,BOOST_CODES[0]),{code:"ENERGY_FULL"});
  await assert.rejects(rewards.start(user,BOOST_CODES[1]),{code:"DOUBLE_ACTIVE"});
  assert.equal((await pool.query("SELECT count(*)::int AS n FROM jigcoin_internal.ad_attempts")).rows[0].n,0);
+});
+
+const refillCode = BOOST_CODES[0];
+const refillVersion = 'refill-v15-20261119';
+async function assigned(player, seconds) {
+  await pool.query(`INSERT INTO jigcoin_internal.refill_cohorts_v15
+    (user_id,policy_version,cohort,cooldown_seconds)
+    VALUES($1,$2,$3,$4)`, [player.id,refillVersion,seconds===120?'treatment_120':'control_300',seconds]);
+}
+const refillMission = player => service().decorateMissions(player,[{code:refillCode,kind:'sponsor'}]).then(rows=>rows[0]);
+
+pgTest('startup readiness requires the installed refill schema',async()=>{
+  await service().assertReady();
+  await pool.query('ALTER TABLE jigcoin_internal.refill_finance_v15 RENAME TO refill_finance_missing');
+  try{await assert.rejects(service().assertReady(),{code:'INSTALL_REFILL_V15_MIGRATION',status:503});}
+  finally{await pool.query('ALTER TABLE jigcoin_internal.refill_finance_missing RENAME TO refill_finance_v15');}
+});
+
+pgTest('refill trial assignments persist without changing previous pilot groups; QA is excluded', async()=>{
+  const {createRefillPolicy}=require('../lib/refillPolicy');
+  const policy=createRefillPolicy({pool,env:{}});
+  await pool.query("INSERT INTO jigcoin_internal.pilot_players_v14 VALUES($1,'holdout'),($2,'refill')",[user.id,other.id]);
+  const players=[user,other,...(await pool.query('INSERT INTO public.users(telegram_id) SELECT n FROM generate_series(11000,11011) n RETURNING *')).rows];
+  const first=await Promise.all(players.map(p=>policy.enroll(p)));
+  assert.deepEqual([...new Set(first.map(p=>p.cooldown_seconds))].sort(),[120,300]);
+  const restarted=createRefillPolicy({pool,env:{}});
+  assert.deepEqual(await Promise.all(players.map(p=>restarted.enroll(p))),first);
+  assert.deepEqual((await pool.query('SELECT ad_group FROM jigcoin_internal.pilot_players_v14 ORDER BY user_id')).rows.map(r=>r.ad_group),['holdout','refill']);
+  const qa=(await pool.query('INSERT INTO public.users(telegram_id) VALUES(12000) RETURNING *')).rows[0];
+  await pool.query('INSERT INTO jigcoin_internal.acquisition_v13 VALUES($1,TRUE)',[qa.id]);
+  assert.equal((await policy.enroll(qa)).group,'qa_120');
+  assert.equal((await policy.peek(qa.id)).excluded,true);
+  const before=first[0];
+  await pool.query('INSERT INTO jigcoin_internal.acquisition_v13 VALUES($1,TRUE)',[user.id]);
+  assert.deepEqual(await policy.enroll(user),before,'later exclusion must not reassign');
+  assert.equal((await policy.peek(user.id)).excluded,true);
+  const held=service({pilot:{refillAvailable:async()=>false}});
+  await assert.rejects(held.start(user,refillCode),{code:'AD_PLACEMENT_CLOSED'});
+});
+
+pgTest('server policy allows prepare at40% of55 and110; available does not mean low enough',async()=>{
+  for(const [cap,above,edge] of [[55,23,22],[110,45,44]]) {
+    const player=(await pool.query('INSERT INTO public.users(telegram_id,energy,max_energy,last_energy_ts) VALUES($1,$2,$3,clock_timestamp()) RETURNING *',[13000+cap,above,cap])).rows[0];
+    let mission=await refillMission(player);
+    assert.equal(mission.status,'available'); assert.equal(mission.prepare_available,false);
+    assert.equal(mission.refill_policy.offer_threshold_pct,30);
+    assert.equal(mission.refill_policy.prepare_threshold_pct,40);
+    await assert.rejects(service().start(player,refillCode),{code:'ENERGY_ABOVE_REFILL_THRESHOLD'});
+    const low=(await pool.query('UPDATE public.users SET energy=$2,last_energy_ts=clock_timestamp() WHERE id=$1 RETURNING *',[player.id,edge])).rows[0];
+    mission=await refillMission(low);
+    assert.equal(mission.prepare_available,true);
+    const attempt=await service().start(low,refillCode);
+    assert.deepEqual(attempt.refill_policy,mission.refill_policy);
+    const saved=(await pool.query('SELECT refill_start_energy,refill_start_cap FROM jigcoin_internal.ad_attempts WHERE ymid=$1',[attempt.ymid])).rows[0];
+    assert.deepEqual(saved,{refill_start_energy:edge,refill_start_cap:cap});
+    assert.equal((await refillMission(low)).prepare_available,false,'pending preparation cannot start again');
+  }
+});
+
+pgTest('cohort cooldown is atomic and stable: control300 never shortens to treatment120',async()=>{
+  for(const [player,seconds] of [[user,300],[other,120]]) {
+    await assigned(player,seconds);
+    const attempt=await service().start(player,refillCode);
+    await service().postback(event(attempt,{telegram_id:String(player.telegram_id)}));
+    const claims=await Promise.all(Array.from({length:4},()=>service().claim(player,refillCode,attempt.ymid)));
+    assert.equal(claims.filter(c=>!c.already_claimed).length,1);
+    assert.equal(claims.find(c=>!c.already_claimed).cooldown_remaining_seconds,seconds);
+    await pool.query('UPDATE public.users SET energy=0,last_energy_ts=clock_timestamp() WHERE id=$1',[player.id]);
+    await pool.query(`UPDATE jigcoin_internal.reward_placements
+      SET claimed_at=clock_timestamp()-interval '130 seconds',
+        next_available_at=clock_timestamp()+make_interval(secs=>$2-130) WHERE user_id=$1`,[player.id,seconds]);
+    const mission=await refillMission(player);
+    assert.equal(mission.cooldown_seconds,seconds);
+    if(seconds===300){
+      assert.equal(mission.status,'cooldown'); assert.ok(mission.cooldown_remaining_seconds>=169);
+      await assert.rejects(service().start(player,refillCode),{code:'MISSION_COOLDOWN'});
+    }else{
+      assert.equal(mission.status,'available'); assert.equal(mission.prepare_available,true);
+      assert.ok((await service().start(player,refillCode)).ymid);
+    }
+  }
+});
+
+pgTest('legacy300/3600/86400 refill receipts remain redeemable with their assigned shorter wait',async()=>{
+  for(const [i,legacy] of [300,3600,86400].entries()) {
+    const player=(await pool.query('INSERT INTO public.users(telegram_id) VALUES($1) RETURNING *',[14000+i])).rows[0];
+    await assigned(player,i===1?300:120);
+    const attempt=await service().start(player,refillCode);
+    await pool.query(`UPDATE jigcoin_internal.ad_attempts SET cooldown_seconds=$2,refill_policy_version=NULL,
+      refill_group=NULL,refill_start_energy=NULL,refill_start_cap=NULL WHERE ymid=$1`,[attempt.ymid,legacy]);
+    await service().postback(event(attempt,{telegram_id:String(player.telegram_id)}));
+    const result=await service().claim(player,refillCode,attempt.ymid);
+    assert.equal(result.cooldown_remaining_seconds,i===1?300:120);
+    assert.equal((await pool.query('SELECT cooldown_seconds FROM jigcoin_internal.ad_attempts WHERE ymid=$1',[attempt.ymid])).rows[0].cooldown_seconds,legacy);
+    assert.equal((await service().claim(player,refillCode,attempt.ymid)).already_claimed,true);
+  }
+});
+
+pgTest('migration rejects partial policy snapshots and120-second nonenergy rewards',async()=>{
+  const attempt=await service().start(user,refillCode);
+  for(const field of ['refill_policy_version','refill_group','refill_start_energy','refill_start_cap'])
+    await assert.rejects(pool.query(`UPDATE jigcoin_internal.ad_attempts SET ${field}=NULL WHERE ymid=$1`,[attempt.ymid]),{code:'23514'});
+  const coin=await service().start(user,CODES[0]);
+  await assert.rejects(pool.query('UPDATE jigcoin_internal.ad_attempts SET cooldown_seconds=120 WHERE ymid=$1',[coin.ymid]),{code:'23514'});
+  const double=await service().start(user,BOOST_CODES[1]);
+  await pool.query('UPDATE jigcoin_internal.ad_attempts SET cooldown_seconds=3600 WHERE ymid=$1',[double.ymid]);
+  await assert.rejects(pool.query('UPDATE jigcoin_internal.ad_attempts SET cooldown_seconds=120 WHERE ymid=$1',[double.ymid]),{code:'23514'});
+});
+
+pgTest('failed ads retain only the retry gate, never a success cooldown or reward',async()=>{
+  await assigned(user,120);
+  const s=service({allowClientOutcome:()=>true,logger:{info(){}}});
+  const attempt=await s.start(user,refillCode);
+  await s.reportOutcome(user,{code:refillCode,attempt_id:attempt.ymid,stage:'preload',error_code:'NO_FILL',elapsed_ms:1400});
+  await assert.rejects(s.claim(user,refillCode,attempt.ymid),{code:'AD_CONFIRMATION_PENDING'});
+  let placement=(await pool.query('SELECT claimed_at,next_available_at FROM jigcoin_internal.reward_placements WHERE user_id=$1',[user.id])).rows[0];
+  assert.deepEqual(placement,{claimed_at:null,next_available_at:null});
+  await assert.rejects(s.start(user,refillCode),{code:'AD_RETRY_LATER'});
+  await pool.query("UPDATE jigcoin_internal.ad_attempts SET created_at=clock_timestamp()-interval '61 seconds' WHERE ymid=$1",[attempt.ymid]);
+  assert.notEqual((await s.start(user,refillCode)).ymid,attempt.ymid);
+  assert.equal((await counts()).ledger,0);
+});
+
+pgTest('lifecycle observations derive policy, deduplicate, enforce ownership and cannot grant rewards',async()=>{
+  await assigned(user,300);
+  const s=service({allowClientLifecycle:()=>true,allowClientOutcome:()=>true,logger:{info(){}}});
+  const attempt=await s.start(user,refillCode);
+  const base={code:refillCode,attempt_id:attempt.ymid,stage:'preload',elapsed_ms:200,
+    refill_policy:{version:'fake',group:'qa_120',cooldown_seconds:120},user_id:other.id,verified:true};
+  for(const errorCode of ['PREPARED','PREPARED_EXPIRED']){
+    assert.equal((await s.reportOutcome(user,{...base,error_code:errorCode})).duplicate,false);
+    assert.equal((await s.reportOutcome(user,{...base,error_code:errorCode})).duplicate,true);
+  }
+  const prompt={...base,stage:'offer',error_code:'PROMPT_SHOWN',attempt_id:null};
+  await s.reportOutcome(user,prompt); await s.reportOutcome(user,prompt);
+  const rows=(await pool.query('SELECT user_id,policy_version,cohort,event FROM jigcoin_internal.refill_events_v15 ORDER BY id')).rows;
+  assert.equal(rows.length,3);
+  assert.ok(rows.every(r=>String(r.user_id)===String(user.id)&&r.policy_version===refillVersion&&r.cohort==='control_300'));
+  await assert.rejects(s.reportOutcome(other,{...base,error_code:'PREPARED'}),{code:'AD_ATTEMPT_NOT_FOUND'});
+  for(const elapsed_ms of [-1,300001,0.5,'10',null,true])
+    await assert.rejects(s.reportOutcome(user,{...base,error_code:'PREPARED',elapsed_ms}),{code:'INVALID_AD_OUTCOME'});
+  await assert.rejects(s.reportOutcome(user,{...prompt,attempt_id:attempt.ymid}),{code:'INVALID_AD_OUTCOME'});
+  await assert.rejects(s.reportOutcome(user,{...base,error_code:'PREPARED',attempt_id:null}),{code:'AD_ATTEMPT_REQUIRED'});
+  await s.reportOutcome(user,{...base,error_code:'SDK_TIMEOUT'});
+  const meta=(await pool.query('SELECT meta FROM public.event_log')).rows[0].meta;
+  assert.deepEqual(meta.refill_policy,{version:refillVersion,group:'control_300',cooldown_seconds:300});
+  assert.equal((await pool.query('SELECT eligible_at,claimed_at FROM jigcoin_internal.ad_attempts WHERE ymid=$1',[attempt.ymid])).rows[0].eligible_at,null);
+  assert.deepEqual(await counts(),{ledger:0,balance:'0',receipts:0});
+});
+
+pgTest('HTTP lifecycle budget does not consume the separate failure-diagnostic budget',async t=>{
+  const attempt=await service().start(user,refillCode);
+  const app=await startIsolatedApp(t,false,{pool,withTransaction:transaction,ledger:{applyBalanceChangeTx},env});
+  const post=body=>fetch(app.url+'/api/mission/outcome',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({initData:signedInitData(Number(user.telegram_id)),code:refillCode,...body})});
+  for(let n=0;n<40;n++)assert.equal((await post({stage:'offer',error_code:'PROMPT_SHOWN',attempt_id:null})).status,200);
+  assert.equal((await post({stage:'offer',error_code:'PROMPT_SHOWN',attempt_id:null})).status,429);
+  assert.equal((await post({stage:'preload',error_code:'SDK_TIMEOUT',attempt_id:attempt.ymid})).status,200);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM jigcoin_internal.refill_events_v15')).rows[0].n,1);
+});
+
+pgTest('v15 scorecard excludes QA/holdout and reports unknown settled revenue asNULL',async()=>{
+  await assigned(user,300); await assigned(other,120);
+  await pool.query("UPDATE jigcoin_internal.refill_cohorts_v15 SET assigned_at=clock_timestamp()-interval '32 days',returned_day7_at=clock_timestamp()-interval '25 days'");
+  await pool.query("INSERT INTO jigcoin_internal.purchase_receipts_v13 VALUES($1,'vip',500,'fixture',clock_timestamp()-interval '30 days',NULL)",[user.id]);
+  const query=fs.readFileSync(path.join(__dirname,'../sql/refill_scorecard_v15.sql'),'utf8');
+  let [report]=await pool.query(query);
+  assert.equal(report.rows.length,2);
+  assert.ok(report.rows.every(r=>r.ads_net_30d_gbp===null&&r.contribution_after_acquisition_per_player_gbp===null));
+  assert.equal(report.rows.find(r=>r.cohort==='control_300').vip_purchases,'1');
+  await pool.query(`INSERT INTO jigcoin_internal.refill_finance_v15
+    (policy_version,cohort_day,cohort,ads_net_gbp,stars_net_gbp,delivery_cost_gbp,acquisition_cost_gbp,coverage_complete,evidence_ref,allocation_method)
+    SELECT policy_version,(assigned_at AT TIME ZONE 'UTC')::date,cohort,0.20,4,0.30,1,TRUE,'fixture evidence only','fixture exact allocation'
+    FROM jigcoin_internal.refill_cohorts_v15 WHERE user_id=$1`,[user.id]);
+  [report]=await pool.query(query);
+  assert.equal(report.rows.find(r=>r.cohort==='control_300').contribution_after_acquisition_per_player_gbp,'2.9000');
+  await pool.query('INSERT INTO jigcoin_internal.acquisition_v13 VALUES($1,TRUE)',[user.id]);
+  await pool.query("INSERT INTO jigcoin_internal.pilot_players_v14 VALUES($1,'holdout')",[other.id]);
+  [report]=await pool.query(query); assert.equal(report.rows.length,0);
+});
+
+pgTest('new cohort, observation and finance tables deny browser roles even with accidentalSELECT grants',async()=>{
+  await service().start(user,refillCode);
+  const client=await pool.connect();
+  try{
+    for(const role of ['anon','authenticated']){
+      await client.query('BEGIN');
+      await client.query(`GRANT USAGE ON SCHEMA jigcoin_internal TO ${role}`);
+      await client.query(`GRANT SELECT ON jigcoin_internal.refill_cohorts_v15,jigcoin_internal.refill_events_v15,jigcoin_internal.refill_finance_v15 TO ${role}`);
+      await client.query(`SET LOCAL ROLE ${role}`);
+      for(const table of ['refill_cohorts_v15','refill_events_v15','refill_finance_v15'])
+        assert.equal((await client.query('SELECT * FROM jigcoin_internal.'+table)).rowCount,0);
+      await client.query('ROLLBACK');
+    }
+  }finally{await client.query('ROLLBACK');client.release();}
 });

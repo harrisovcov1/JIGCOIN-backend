@@ -538,7 +538,8 @@ const invite = createInvite({pool,botUsername:BOT_USERNAME,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const weeklyRace = createWeeklyRace({pool, withTransaction});
 const allowClientOutcome = userId => hit(`reward-outcome:${userId}`, 12, 10 * 60_000);
-const monetagRewards = createMonetagRewards({ pilot:weeklyRace, journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap, allowClientOutcome });
+const allowClientLifecycle = userId => hit(`reward-observation:${userId}`, 40, 10 * 60_000);
+const monetagRewards = createMonetagRewards({ pilot:weeklyRace, journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap, allowClientOutcome, allowClientLifecycle });
 
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
 const streakReminder = createStreakReminder({pool,withTransaction,callTelegram:telegramClient(process.env),
@@ -658,7 +659,7 @@ for(const [path,service] of [["/api/admin/stars/refund",starsShop],["/api/admin/
 app.use(cohortMiddleware({env:process.env,verifyTelegramInitData}));
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction, pilot:weeklyRace,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig: () => publicClientConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards, allowClientOutcome }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig: () => publicClientConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards, allowClientOutcome, allowClientLifecycle }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -4464,6 +4465,7 @@ async function start() {
     await vipPass.assertReady();
     await leaderboards.assertReady();
     await journey.assertReady();
+    await monetagRewards.assertReady();
     await streakReminder.prepare();
     if (process.env.JIGCOIN_INSTALL_PILOT_SCHEMA === '1') {
       await weeklyRace.prepareRelease();

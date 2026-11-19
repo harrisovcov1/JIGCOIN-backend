@@ -22,7 +22,7 @@ function database({ failInsert = false, omitReceipt = false } = {}) {
       const id = String(args[0]);
       return { rows: id === '10001' ? [{ ...user }] : id === '10002' ? [{ ...user, id: 2, telegram_id: '10002' }] : [] };
     }
-    if (/^SELECT ymid FROM jigcoin_internal\.ad_attempts/.test(sql.trim())) {
+    if (/^SELECT ymid,refill_policy_version,refill_group,cooldown_seconds FROM jigcoin_internal\.ad_attempts/.test(sql.trim())) {
       return { rows: attempts.filter(a => a.ymid === args[0] && a.user_id === args[1] && a.code === args[2]).map(a => ({ ymid: a.ymid })) };
     }
     if (/^INSERT INTO public\.event_log/.test(sql.trim())) {
@@ -59,7 +59,7 @@ test('outcome persistence and logs retain only bounded fields, without changing 
   assert.deepEqual(db.events, [{ user_id: 1, event: 'reward_client_outcome_v1', meta: outcome() }]);
   assert.deepEqual(db.attempts, before);
   assert.equal(db.calls.filter(c => /^INSERT/.test(c.sql.trim())).length, 1);
-  assert.ok(db.calls.every(c => /^SELECT ymid FROM jigcoin_internal\.ad_attempts|^INSERT INTO public\.event_log/.test(c.sql.trim())));
+  assert.ok(db.calls.every(c => /^SELECT ymid,refill_policy_version,refill_group,cooldown_seconds FROM jigcoin_internal\.ad_attempts|^INSERT INTO public\.event_log/.test(c.sql.trim())));
   assert.deepEqual(logs, ['JigCoin reward client outcome ' + JSON.stringify({ stage: 'display', error_code: 'DISPLAY_REJECTED', attempt_id: ATTEMPT })]);
   assert.doesNotMatch(JSON.stringify(db.events) + logs.join(''), /private|telegram_id|reward_amount|verified|stack/);
 });
