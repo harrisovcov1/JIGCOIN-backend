@@ -537,7 +537,8 @@ const referralCredit = createReferralCredit({pool,withTransaction,journey,
 const invite = createInvite({pool,botUsername:BOT_USERNAME,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const weeklyRace = createWeeklyRace({pool, withTransaction});
-const monetagRewards = createMonetagRewards({ pilot:weeklyRace, journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap });
+const allowClientOutcome = userId => hit(`reward-outcome:${userId}`, 12, 10 * 60_000);
+const monetagRewards = createMonetagRewards({ pilot:weeklyRace, journey, pool, withTransaction, applyBalanceChangeTx, env: process.env, getEnergyCap, allowClientOutcome });
 
 const streakRestore = createStreakRestore({pool,withTransaction,env:process.env,callTelegram:telegramClient(process.env)});
 const streakReminder = createStreakReminder({pool,withTransaction,callTelegram:telegramClient(process.env),
@@ -657,7 +658,7 @@ for(const [path,service] of [["/api/admin/stars/refund",starsShop],["/api/admin/
 app.use(cohortMiddleware({env:process.env,verifyTelegramInitData}));
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction, pilot:weeklyRace,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig: () => publicClientConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig: () => publicClientConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards, allowClientOutcome }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -707,6 +708,21 @@ app.get('/api/shop/starter-offer',(_req,res)=>res.json({ok:true,available:false}
 // Authenticated, server-counted challenges. The maintenance guard above applies.
 app.post('/api/progression',monetagRewards.handler(async req=>progression.status(await getOrCreateUserFromInitData(req))));
 app.post('/api/progression/claim',monetagRewards.handler(async req=>progression.claim(await getOrCreateUserFromInitData(req),req.body)));
+
+// Diagnostic input uses an existing authenticated account. Do not register a
+// player, settle referrals or project/persist gameplay just to record a report.
+app.post('/api/mission/outcome', monetagRewards.handler(async req => {
+  const raw = req.body?.initData || req.headers['x-telegram-initdata'];
+  const token = String(process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || '').trim();
+  let identity;
+  try {
+    if (!verifyTelegramInitData(raw, token).ok) throw Error('invalid auth');
+    identity = JSON.parse(new URLSearchParams(raw).get('user'));
+    if (!Number.isSafeInteger(identity?.id) || identity.id <= 0 || identity.is_bot) throw Error('invalid user');
+  } catch (_) { throw Object.assign(Error('UNAUTHORIZED'), { code: 'UNAUTHORIZED', status: 401 }); }
+  const { rows } = await pool.query('SELECT id,telegram_id,is_system_user,banned_until FROM public.users WHERE telegram_id=$1', [identity.id]);
+  return monetagRewards.reportOutcome(rows[0], req.body);
+}));
 
 // Verified rewarded quests supersede the legacy timer-only handlers below.
 for (const action of ["start", "complete"]) {
