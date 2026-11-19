@@ -41,9 +41,31 @@ test("normal mode allows the configuration handler and does not grow middleware"
   const count = app.middlewareCount();
   const response = await fetch(app.url + "/api/config", { method: "POST" });
   assert.equal(response.status, 200);
-  assert.equal((await response.json()).ok, true);
-  assert.equal(app.configReads(), 1);
+  assert.deepEqual(await response.json(), {ok:true, config:{}});
+  assert.equal(app.configReads(), 0, "internal settings stay server-side");
   assert.equal(app.middlewareCount(), count);
+});
+
+test("support diagnostics require admin access and return bounded projected fields without changing the account", async t => {
+  const dbNow = new Date();
+  const calls = [];
+  const pool = { async query(sql, args) {
+    calls.push({sql,args});
+    return {rows:[{balance:"1234", energy:37, max_energy:50, last_reset:dbNow.toISOString().slice(0,10),
+      last_energy_ts:dbNow, today_farmed:8, taps_today:7, db_now:dbNow, internal_marker:"private"}]};
+  }};
+  const app = await startIsolatedApp(t,false,{pool,env:{ADMIN_KEY:"local-admin-fixture"}});
+  const route = app.url + "/api/state-debug?telegram_id=10001";
+  const denied = await fetch(route);
+  assert.equal(denied.status,403);
+  assert.equal(calls.length,0);
+  const response = await fetch(route,{headers:{"X-Admin-Key":"local-admin-fixture"}});
+  assert.equal(response.status,200);
+  assert.equal(response.headers.get("cache-control"),"no-store");
+  assert.deepEqual(await response.json(),{ok:true,balance:1234,energy:37,today:8,taps_today:7});
+  assert.equal(calls.length,1);
+  assert.match(calls[0].sql.trim(),/^SELECT /);
+  assert.deepEqual([...calls[0].args],["10001"]);
 });
 
 test("new reward routes require Telegram authentication and legacy ad bypasses stay closed", async t => {
@@ -88,7 +110,8 @@ function readOnlyTestPool({ missing = false, system = false } = {}) {
   return {queries, async query(sql, args) {
     queries.push({sql,args});
     assert.match(sql.trim(),/^SELECT/i,"state and mission listing must not write");
-    if (/telegram_id\s*=\s*\$1/i.test(sql)) return { rows:missing?[]:[{
+    if (/telegram_id\s*=\s*\$1|standings\.place/i.test(sql)) return { rows:missing?[]:[{
+      place:1,total:1,sampled_us:Date.now()*1000,
       id:23,telegram_id:"10001",balance:"1234",energy:12,streak_count:4,
       last_checkin_at:"2020-01-01T00:00:00Z",is_system_user:system,has_completed_onboarding:false,
     }] };
@@ -135,7 +158,7 @@ test("authorized recovery state and mission listing are read-only with public re
   const list=await post(app,"/api/mission/list",{...auth,kind:"anything",include_boost_sponsor_missions:true});
   assert.equal(list.status,200); assert.equal(list.body.missions.length,1);
   assert.equal(list.body.missions[0].code,"sp_visit_partner");
-  assert.equal(list.body.missions[0].status,"available");
+  assert.equal(list.body.missions[0].status,"unavailable", "the pilot retires new coin adverts while keeping recorded rewards");
   assert.equal(list.body.missions[0].payout_amount,200);
   assert.ok(!JSON.stringify(list.body).includes(testEnv.MONETAG_POSTBACK_SECRET));
   assert.ok(pool.queries.every(q=>/^SELECT/i.test(q.sql.trim())));

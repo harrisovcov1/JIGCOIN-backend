@@ -166,7 +166,7 @@ integration('verified v13 coin awards survive retirement; low-energy refill cred
   const {applyBalanceChangeTx} = require('../lib/ledger');
   const dir=path.join(__dirname,'../sql/migrations');
   await pool.query(`ALTER TABLE public.users ADD energy integer DEFAULT 0, ADD max_energy integer DEFAULT 50,
-      ADD last_energy_ts timestamptz, ADD double_boost_until timestamptz;
+      ADD last_energy_ts timestamptz DEFAULT clock_timestamp(), ADD last_reset date DEFAULT (now() AT TIME ZONE 'UTC')::date, ADD double_boost_until timestamptz;
     CREATE TABLE public.missions(id serial PRIMARY KEY, code text UNIQUE, kind text, is_active boolean DEFAULT true);
     CREATE TABLE public.user_missions(user_id bigint,mission_id integer,status text,started_at timestamptz,
       completed_at timestamptz,verified_at timestamptz,claimed_at timestamptz,reward_applied boolean,UNIQUE(user_id,mission_id));
@@ -193,12 +193,19 @@ integration('verified v13 coin awards survive retirement; low-energy refill cred
   assert.equal(cards[0].status,'claimable');
   const credits=await Promise.all([current.claim(user,coin,old.ymid),current.claim(user,coin,old.ymid)]);
   assert.equal(credits.filter(x=>x.already_claimed).length,1);
-  await pool.query('UPDATE public.users SET energy=11 WHERE id=$1',[user.id]);
+  await pool.query("UPDATE public.users SET energy=2,last_energy_ts=clock_timestamp()-interval '10 minutes' WHERE id=$1",[user.id]);
+  await assert.rejects(()=>current.start(user,refill),{code:'ENERGY_FULL'});
+  await pool.query('UPDATE public.users SET energy=11,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
   await assert.rejects(()=>current.start(user,refill),{code:'ENERGY_ABOVE_REFILL_THRESHOLD'});
-  await pool.query('UPDATE public.users SET energy=10 WHERE id=$1',[user.id]);
+  await pool.query('UPDATE public.users SET energy=10,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
   const attempt=await current.start(user,refill);
   await assert.rejects(()=>current.claim(user,refill,attempt.ymid),{code:'AD_CONFIRMATION_PENDING'});
   await confirm(attempt);
+  await pool.query("UPDATE public.users SET energy=49,last_energy_ts=clock_timestamp()-interval '7 seconds' WHERE id=$1",[user.id]);
+  await assert.rejects(()=>current.claim(user,refill,attempt.ymid),{code:'ENERGY_FULL'});
+  const pending = await pool.query('SELECT claimed_at FROM jigcoin_internal.ad_attempts WHERE ymid=$1',[attempt.ymid]);
+  assert.equal(pending.rows[0].claimed_at,null);
+  await pool.query('UPDATE public.users SET energy=30,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
   const refills=await Promise.all([current.claim(user,refill,attempt.ymid),current.claim(user,refill,attempt.ymid)]);
   assert.equal(refills.filter(x=>x.already_claimed).length,1);
   const saved=(await pool.query('SELECT balance,energy FROM public.users WHERE id=$1',[user.id])).rows[0];
