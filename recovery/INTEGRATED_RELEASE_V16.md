@@ -1,6 +1,6 @@
 # JigCoin integrated release v16
 
-Prepared on 19 November 2026. This document describes the approved release contract and deployment procedure; it is not evidence of a production deployment.
+Released on 19 November 2026. This document describes the approved release contract and deployment procedure. The completed deployment checks are recorded below and in `recovery/integrated_v16_release_verification.json`.
 
 ## Scope
 
@@ -97,9 +97,16 @@ Before 23 November, the additive schema remains compatible with the old serverâ€
 
 After the daily policy activates, retain the upgraded weekly handlers or use a forward fix. Reverting completely to v14 would restore three runs per week and remove practice/end routes. Waiting 45 seconds drains a live puzzle but does not preserve those new entitlements. Existing immutable awards and new pending referral contracts must remain intact.
 
-## Open acceptance items
+## Completed production deployment â€” 19 November 2026
 
-- Publication and deployment of this release are not yet complete.
-- Corrected synthetic mobile preview publication and visual verification are outstanding.
-- No new real-money Telegram transaction or real-provider advert was initiated during these local checks.
-- Revenue uplift must be measured from eligible live cohorts after release; it cannot be guaranteed from UI changes alone.
+- Both additive migrations are installed. The exact production verifier passed 183/183 checks, with no blockers or new security warnings; all existing referral relationships and current weekly runs were retained.
+- Backend PR #7 was merged. Render deployment `dep-dbvju7vf3r2c73cfqn0g` is live on commit `f5c51856f855b89b5996863ebfd86457890670d2`. Startup confirmed the weekly schema and release were ready before listening. HTTP health reports `v16-integrated-1`, `ok: true`, and `db: up`.
+- Frontend PR #13 was merged. Cloudflare Pages deployment `ce2ca357-9a4c-413f-b87b-8cfccfc70570` succeeded for commit `740d343ee5e086a8f3383844b85830e76e724a08`. The live HTML and all four changed/new visual assets exactly match the reviewed local files. No generated mock page is referenced by production.
+- Final frontend tests passed 307/307 with zero failures/skips. Browser review covered 320, 390 and 430 CSS-pixel widths, including active/expired/pending VIP, long names, invitation progress/welcome, solo/two/three-player standings, current/future ranked policy and practice start/answer/end with unchanged ranked quota.
+- Live protected endpoints reject unsigned requests with HTTP 401. The public browser launch correctly requests a Telegram session. The screenshot in frontend `recovery/vip-mobile-preview-v16.jpg` uses a synthetic account and the actual UI controllers.
+
+## Limits of this verification
+
+Authenticated production gameplay was not exercised through a live Telegram session in the cloud browser. Actual controllers were exercised with synthetic API responses, and backend behavior was tested against isolated PostgreSQL. No real Stars purchase or provider advert was initiated during this release verification. The working refill paths are retained.
+
+Revenue uplift must be measured from eligible live cohorts after release; it cannot be guaranteed from UI changes alone. The complete version, endpoint and file-comparison evidence is in `recovery/integrated_v16_release_verification.json`.

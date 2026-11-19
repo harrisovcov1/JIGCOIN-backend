@@ -1,0 +1,165 @@
+{
+  "release": "v16-integrated-1",
+  "verified_at": "2026-11-19T18:31:44.037982+00:00",
+  "backend": {
+    "repository": "harrisovcov1/JIGCOIN-backend",
+    "pull_request": 7,
+    "deployed_commit": "f5c51856f855b89b5996863ebfd86457890670d2",
+    "render_deploy": "dep-dbvju7vf3r2c73cfqn0g",
+    "status": "live",
+    "finished_at": "2026-11-19T18:26:00.713947Z",
+    "startup_schema_ready": true,
+    "startup_release_ready": true
+  },
+  "frontend": {
+    "repository": "harrisovcov1/JIGCOIN-frontend",
+    "pull_request": 13,
+    "deployed_commit": "740d343ee5e086a8f3383844b85830e76e724a08",
+    "pages_deployment": "ce2ca357-9a4c-413f-b87b-8cfccfc70570",
+    "pages_check": "success",
+    "production_url": "https://jigcoin-frontend.pages.dev/",
+    "files": [
+      {
+        "file": "index.html",
+        "status": 200,
+        "url": "https://jigcoin-frontend.pages.dev/",
+        "bytes": 499922,
+        "sha256": "a51d0d325055643902c0a2af17661d1d48a9b69b352b5e689e472a8a385478b5",
+        "matches_reviewed_file": true,
+        "release_marker": true,
+        "mock_fixture_absent": true
+      },
+      {
+        "file": "assets/integrated.css",
+        "status": 200,
+        "url": "https://jigcoin-frontend.pages.dev/assets/integrated.css",
+        "bytes": 23978,
+        "sha256": "05a175f29fcddd54de499fd85db8e5c1d35d13e8518f35bcce16cc61e04a70ee",
+        "matches_reviewed_file": true
+      },
+      {
+        "file": "assets/mint-world.css",
+        "status": 200,
+        "url": "https://jigcoin-frontend.pages.dev/assets/mint-world.css",
+        "bytes": 17326,
+        "sha256": "f5f2fd2c9e3ea24e7f70b0da5ee744eead9bd38c281ae571a86f4ace8d588f64",
+        "matches_reviewed_file": true
+      },
+      {
+        "file": "assets/vip-crown.svg",
+        "status": 200,
+        "url": "https://jigcoin-frontend.pages.dev/assets/vip-crown.svg",
+        "bytes": 2036,
+        "sha256": "effc406415a67171734d31e7fcf78c19adafd7fe7654437cee80e2fc1c146aab",
+        "matches_reviewed_file": true
+      },
+      {
+        "file": "assets/invite-people.svg",
+        "status": 200,
+        "url": "https://jigcoin-frontend.pages.dev/assets/invite-people.svg",
+        "bytes": 1514,
+        "sha256": "c8a55302f0fadb1cc3c841ea12e768aa92ea449efbeff254bbdab8119e908002",
+        "matches_reviewed_file": true
+      }
+    ]
+  },
+  "api_checks": [
+    {
+      "path": "/health",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "db": "up",
+        "release": "v16-integrated-1",
+        "jobs": {
+          "pending": 0,
+          "failed": 1
+        }
+      }
+    },
+    {
+      "path": "/api/config",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "config": {}
+      }
+    },
+    {
+      "path": "/api/weekly/standings",
+      "status": 401,
+      "body": {
+        "ok": false,
+        "error": "UNAUTHORIZED"
+      }
+    },
+    {
+      "path": "/api/weekly/practice/start",
+      "status": 401,
+      "body": {
+        "ok": false,
+        "error": "UNAUTHORIZED"
+      }
+    },
+    {
+      "path": "/api/invite/history",
+      "status": 401,
+      "body": {
+        "ok": false,
+        "error": "UNAUTHORIZED"
+      }
+    }
+  ],
+  "test_results": {
+    "frontend": {
+      "passed": 307,
+      "failed": 0,
+      "skipped": 0
+    },
+    "backend_isolated_postgres": {
+      "passed": 134,
+      "failed": 0,
+      "skipped": 0
+    },
+    "production_database": {
+      "passed": 183,
+      "blocked": 0,
+      "new_security_warnings": 0
+    }
+  },
+  "browser": {
+    "preview_url": "https://499162ff.jigcoin-frontend.pages.dev/recovery/integrated-mobile-review",
+    "viewports": [
+      "320x568",
+      "390x746",
+      "430x832"
+    ],
+    "accounts": "synthetic",
+    "checked_states": [
+      "all five coin packs and VIP summary",
+      "active, expired and pending VIP",
+      "payment verification retry",
+      "referral progress and long names",
+      "invited-player welcome",
+      "solo, two-player and three-player standings",
+      "legacy and daily ranked allowance",
+      "practice start, correct answer, timeout, result and unchanged ranked quota",
+      "sticky timer and footer-safe scrolling"
+    ],
+    "live_unauthenticated_launch": "correctly requires a Telegram session",
+    "application_console_errors_observed": 0,
+    "screenshot": "frontend recovery/vip-mobile-preview-v16.jpg"
+  },
+  "activation": {
+    "daily_ranked_runs_at": "2026-11-23T00:00:00Z",
+    "daily_ranked_runs": 3,
+    "current_week_original_allowance_preserved": true
+  },
+  "limitations": [
+    "No live authenticated Telegram gameplay session was available in the browser; authenticated game transitions were tested using the actual controllers with mock responses and backend handlers with isolated PostgreSQL.",
+    "No real Stars purchase or real-provider advert was initiated during this release verification.",
+    "Revenue improvement remains to be measured from live cohorts.",
+    "The health endpoint retains one pre-existing failed background job; it predates this release.",
+    "The unrelated legacy Workers check is separate from the successful Cloudflare Pages release."
+  ]
+}
