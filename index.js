@@ -691,7 +691,11 @@ for (const [route, action] of Object.entries({
   '/api/pilot/coin': (user, body) => weeklyRace.profile(user, body.equip),
   '/api/weekly/standings': (user, body) => weeklyRace.standings(user, body),
   '/api/weekly/start': (user, body) => weeklyRace.start(user, body),
-  '/api/weekly/answer': (user, body) => weeklyRace.answer(user, body)
+  '/api/weekly/answer': (user, body) => weeklyRace.answer(user, body),
+  '/api/weekly/end': (user, body) => weeklyRace.end(user, body),
+  '/api/weekly/practice/start': (user, body) => weeklyRace.practiceStart(user, body),
+  '/api/weekly/practice/answer': (user, body) => weeklyRace.practiceAnswer(user, body),
+  '/api/weekly/practice/end': (user, body) => weeklyRace.practiceEnd(user, body)
 })) {
   app.post(route, leaderboards.handler(async req => action(await getOrCreateUserFromInitData(req), req.body)));
 }
@@ -2384,6 +2388,7 @@ app.get("/health", async (req, res) => {
     return res.json({
       ok: true,
       db: "up",
+      release: "v16-integrated-1",
       jobs: {
         pending: pendingJobs,
         failed: failedJobs,
@@ -4467,10 +4472,8 @@ async function start() {
     await journey.assertReady();
     await monetagRewards.assertReady();
     await streakReminder.prepare();
-    if (process.env.JIGCOIN_INSTALL_PILOT_SCHEMA === '1') {
-      await weeklyRace.prepareRelease();
-      console.log('JIGCOIN weekly races and Mint result cards ready (024/025)');
-    }
+    await weeklyRace.prepareRelease();
+    console.log('JIGCOIN weekly race rules, practice and award history ready (v16)');
   } catch (err) {
     console.error("Fatal schema initialization error:", err);
     process.exit(1);
@@ -4481,10 +4484,13 @@ async function start() {
   // --- HTTP API ---
   if (mode === "api" || mode === "api+bot") {
     app.listen(PORT, () => {
-      console.log('JIGCOIN backend v14 ready');
+      console.log('JIGCOIN backend v16 integrated release ready');
       leaderboards.kickFinalizer();
       const leaderboardTimer=setInterval(()=>leaderboards.kickFinalizer(),60000);
       leaderboardTimer.unref?.();
+      weeklyRace.kickFinalizer();
+      const weeklyTimer=setInterval(()=>weeklyRace.kickFinalizer(),60000);
+      weeklyTimer.unref?.();
       const deliverReminders=()=>streakReminder.dispatch().catch(()=>console.error('Daily reminder delivery unavailable'));
       deliverReminders();
       const reminderTimer=setInterval(deliverReminders,15000);
