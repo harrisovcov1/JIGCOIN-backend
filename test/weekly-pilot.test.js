@@ -161,7 +161,7 @@ integration('scorecard excludes owner accounts and only values evidenced, comple
   assert.equal(after.rows.find(r=>r.window_complete).contribution_after_acquisition_per_player_gbp,'2.9000');
   assert.ok(events.rows.some(r=>r.entrants==='2' && r.returned_next_week==='1'));
 });
-integration('verified v13 coin awards survive retirement; low-energy refill credits only once', async () => {
+integration('verified v13 coin awards survive retirement; any below-full refill credits only once', async () => {
   const {ALL_CODES} = require('../lib/monetagRewards');
   const {applyBalanceChangeTx} = require('../lib/ledger');
   const dir=path.join(__dirname,'../sql/migrations');
@@ -196,9 +196,7 @@ integration('verified v13 coin awards survive retirement; low-energy refill cred
   assert.equal(credits.filter(x=>x.already_claimed).length,1);
   await pool.query("UPDATE public.users SET energy=2,last_energy_ts=clock_timestamp()-interval '10 minutes' WHERE id=$1",[user.id]);
   await assert.rejects(()=>current.start(user,refill),{code:'ENERGY_FULL'});
-  await pool.query('UPDATE public.users SET energy=21,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
-  await assert.rejects(()=>current.start(user,refill),{code:'ENERGY_ABOVE_REFILL_THRESHOLD'});
-  await pool.query('UPDATE public.users SET energy=20,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
+  await pool.query('UPDATE public.users SET energy=49,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
   const attempt=await current.start(user,refill);
   await assert.rejects(()=>current.claim(user,refill,attempt.ymid),{code:'AD_CONFIRMATION_PENDING'});
   await confirm(attempt);

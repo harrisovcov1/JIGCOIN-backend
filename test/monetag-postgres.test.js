@@ -374,22 +374,27 @@ pgTest('refill trial assignments persist without changing previous pilot groups;
   await assert.rejects(held.start(user,refillCode),{code:'AD_PLACEMENT_CLOSED'});
 });
 
-pgTest('server policy allows prepare at40% of55 and110; available does not mean low enough',async()=>{
-  for(const [cap,above,edge] of [[55,23,22],[110,45,44]]) {
-    const player=(await pool.query('INSERT INTO public.users(telegram_id,energy,max_energy,last_energy_ts) VALUES($1,$2,$3,clock_timestamp()) RETURNING *',[13000+cap,above,cap])).rows[0];
+pgTest('refill preparation works below full energy for caps55 and110 without an attempt retry gate',async()=>{
+  for(const cap of [55,110]) {
+    const player=(await pool.query('INSERT INTO public.users(telegram_id,energy,max_energy,last_energy_ts) VALUES($1,$2,$3,clock_timestamp()) RETURNING *',[13000+cap,cap,cap])).rows[0];
     let mission=await refillMission(player);
     assert.equal(mission.status,'available'); assert.equal(mission.prepare_available,false);
     assert.equal(mission.refill_policy.offer_threshold_pct,30);
-    assert.equal(mission.refill_policy.prepare_threshold_pct,40);
-    await assert.rejects(service().start(player,refillCode),{code:'ENERGY_ABOVE_REFILL_THRESHOLD'});
-    const low=(await pool.query('UPDATE public.users SET energy=$2,last_energy_ts=clock_timestamp() WHERE id=$1 RETURNING *',[player.id,edge])).rows[0];
+    assert.equal(mission.refill_policy.prepare_threshold_pct,100);
+    assert.equal(mission.refill_policy.ready_ttl_ms,300000);
+    assert.equal(mission.refill_policy.retry_seconds,0);
+    await assert.rejects(service().start(player,refillCode),{code:'ENERGY_FULL'});
+    const low=(await pool.query('UPDATE public.users SET energy=$2,last_energy_ts=clock_timestamp() WHERE id=$1 RETURNING *',[player.id,cap-1])).rows[0];
     mission=await refillMission(low);
     assert.equal(mission.prepare_available,true);
     const attempt=await service().start(low,refillCode);
     assert.deepEqual(attempt.refill_policy,mission.refill_policy);
     const saved=(await pool.query('SELECT refill_start_energy,refill_start_cap FROM jigcoin_internal.ad_attempts WHERE ymid=$1',[attempt.ymid])).rows[0];
-    assert.deepEqual(saved,{refill_start_energy:edge,refill_start_cap:cap});
-    assert.equal((await refillMission(low)).prepare_available,false,'pending preparation cannot start again');
+    assert.deepEqual(saved,{refill_start_energy:cap-1,refill_start_cap:cap});
+    mission=await refillMission(low);
+    assert.equal(mission.status,'available');
+    assert.equal(mission.prepare_available,true,'an unconfirmed attempt does not impose a retry delay');
+    assert.equal(mission.retry_after_seconds,0);
   }
 });
 
@@ -443,18 +448,62 @@ pgTest('migration rejects partial policy snapshots and120-second nonenergy rewar
   await assert.rejects(pool.query('UPDATE jigcoin_internal.ad_attempts SET cooldown_seconds=120 WHERE ymid=$1',[double.ymid]),{code:'23514'});
 });
 
-pgTest('failed ads retain only the retry gate, never a success cooldown or reward',async()=>{
+pgTest('a no-fill refill retries immediately with a fresh id and grants no reward or cooldown',async()=>{
   await assigned(user,120);
   const s=service({allowClientOutcome:()=>true,logger:{info(){}}});
   const attempt=await s.start(user,refillCode);
   await s.reportOutcome(user,{code:refillCode,attempt_id:attempt.ymid,stage:'preload',error_code:'NO_FILL',elapsed_ms:1400});
   await assert.rejects(s.claim(user,refillCode,attempt.ymid),{code:'AD_CONFIRMATION_PENDING'});
-  let placement=(await pool.query('SELECT claimed_at,next_available_at FROM jigcoin_internal.reward_placements WHERE user_id=$1',[user.id])).rows[0];
+  const placement=(await pool.query('SELECT claimed_at,next_available_at FROM jigcoin_internal.reward_placements WHERE user_id=$1',[user.id])).rows[0];
   assert.deepEqual(placement,{claimed_at:null,next_available_at:null});
-  await assert.rejects(s.start(user,refillCode),{code:'AD_RETRY_LATER'});
-  await pool.query("UPDATE jigcoin_internal.ad_attempts SET created_at=clock_timestamp()-interval '61 seconds' WHERE ymid=$1",[attempt.ymid]);
-  assert.notEqual((await s.start(user,refillCode)).ymid,attempt.ymid);
-  assert.equal((await counts()).ledger,0);
+  const mission=await refillMission(user);
+  assert.equal(mission.status,'available');
+  assert.equal(mission.prepare_available,true);
+  assert.equal(mission.retry_after_seconds,0);
+  assert.equal(mission.cooldown_remaining_seconds,0);
+  const retry=await s.start(user,refillCode);
+  assert.notEqual(retry.ymid,attempt.ymid);
+  await assert.rejects(s.claim(user,refillCode,retry.ymid),{code:'AD_CONFIRMATION_PENDING'});
+  const attempts=(await pool.query('SELECT ymid,cycle_id,eligible_at,claimed_at FROM jigcoin_internal.ad_attempts WHERE user_id=$1 ORDER BY created_at',[user.id])).rows;
+  assert.equal(attempts.length,2);
+  assert.equal(attempts[0].cycle_id,attempts[1].cycle_id);
+  assert.ok(attempts.every(a=>a.eligible_at===null&&a.claimed_at===null));
+  assert.equal((await pool.query('SELECT energy FROM public.users WHERE id=$1',[user.id])).rows[0].energy,0);
+  assert.deepEqual(await counts(),{ledger:0,balance:'0',receipts:0});
+});
+
+pgTest('immediate refill retries and late receipts can fulfil each reward cycle only once',async()=>{
+  await assigned(user,120);
+  const [first,retry,late]=await Promise.all(Array.from({length:3},()=>rewards.start(user,refillCode)));
+  assert.equal(new Set([first.ymid,retry.ymid,late.ymid]).size,3);
+  await Promise.all([rewards.postback(event(first)),rewards.postback(event(retry))]);
+  await assert.rejects(rewards.start(user,refillCode),{code:'REWARD_ALREADY_READY'});
+  const claims=await Promise.allSettled([first,retry,first,retry].map(a=>rewards.claim(user,refillCode,a.ymid)));
+  const credited=claims.filter(result=>result.status==='fulfilled'&&!result.value.already_claimed);
+  assert.equal(credited.length,1);
+  assert.equal(credited[0].value.cooldown_remaining_seconds,120);
+  assert.ok(claims.filter(result=>result.status==='rejected').every(result=>result.reason.code==='MISSION_COOLDOWN'));
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM jigcoin_internal.ad_attempts WHERE claimed_at IS NOT NULL')).rows[0].n,1);
+  assert.equal((await pool.query('SELECT energy FROM public.users WHERE id=$1',[user.id])).rows[0].energy,50);
+
+  // Advance only the isolated successful-claim clock, then start a new cycle.
+  await pool.query('UPDATE public.users SET energy=0,last_energy_ts=clock_timestamp() WHERE id=$1',[user.id]);
+  await pool.query(`UPDATE jigcoin_internal.reward_placements
+    SET claimed_at=clock_timestamp()-interval '121 seconds',next_available_at=clock_timestamp()-interval '1 second'
+    WHERE user_id=$1 AND code=$2`,[user.id,refillCode]);
+  const next=await rewards.start(user,refillCode);
+  await rewards.postback(event(late));
+  await assert.rejects(rewards.claim(user,refillCode,late.ymid),{code:'AD_ATTEMPT_EXPIRED'});
+  const mission=await refillMission(user);
+  assert.equal(mission.status,'available','a receipt from the previous cycle cannot unlock the next refill');
+  assert.equal(mission.attempt_id,null);
+  await assert.rejects(rewards.claim(user,refillCode,next.ymid),{code:'AD_CONFIRMATION_PENDING'});
+  assert.equal((await pool.query('SELECT energy FROM public.users WHERE id=$1',[user.id])).rows[0].energy,0);
+  await rewards.postback(event(next));
+  const nextClaims=await Promise.all(Array.from({length:4},()=>rewards.claim(user,refillCode,next.ymid)));
+  assert.equal(nextClaims.filter(result=>!result.already_claimed).length,1);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM jigcoin_internal.ad_attempts WHERE claimed_at IS NOT NULL')).rows[0].n,2);
+  assert.deepEqual(await counts(),{ledger:0,balance:'0',receipts:4});
 });
 
 pgTest('lifecycle observations derive policy, deduplicate, enforce ownership and cannot grant rewards',async()=>{
