@@ -72,6 +72,48 @@ test('attempt ownership and placement are checked before recording', async () =>
   assert.equal(db.events.length, 0);
 });
 
+test('preload deadline is distinct from SDK timeout and optional timing is bounded and persisted safely', async () => {
+  const db = database(), logs = [];
+  const before = structuredClone(db.attempts);
+  const rewards = service(db, { logger: { info: line => logs.push(line) } });
+  for (const elapsedMs of [0, 9487, 300000]) {
+    const input = outcome({ stage: 'preload', error_code: 'PRELOAD_DEADLINE', elapsed_ms: elapsedMs });
+    await rewards.reportOutcome(user, {
+      ...input, error: 'private provider text', cancellation_reason: 'private navigation data',
+    });
+    assert.deepEqual(db.events.at(-1).meta, input);
+    assert.equal(logs.at(-1), 'JigCoin reward client outcome ' + JSON.stringify({
+      stage: 'preload', error_code: 'PRELOAD_DEADLINE', attempt_id: ATTEMPT, elapsed_ms: elapsedMs,
+    }));
+  }
+  const legacy = outcome({ stage: 'preload', error_code: 'SDK_TIMEOUT' });
+  await rewards.reportOutcome(user, legacy);
+  assert.deepEqual(db.events.at(-1).meta, legacy);
+  assert.equal(Object.hasOwn(db.events.at(-1).meta, 'elapsed_ms'), false);
+  await assert.rejects(rewards.reportOutcome(user, outcome({ error_code: 'PRELOAD_DEADLINE', elapsed_ms: 12000 })),
+    { code: 'INVALID_AD_OUTCOME', status: 400 });
+  assert.equal(db.events.length, 4);
+  assert.deepEqual(db.attempts, before);
+  assert.doesNotMatch(JSON.stringify(db.events) + logs.join(''), /private|cancellation_reason/);
+});
+
+test('invalid elapsed timing is rejected before ownership queries, rate limiting, persistence or logs', async () => {
+  const db = database(), logs = [];
+  let limiterCalls = 0;
+  const rewards = service(db, {
+    allowClientOutcome: () => { limiterCalls++; return true; },
+    logger: { info: line => logs.push(line) },
+  });
+  for (const elapsedMs of [-1, 300001, 1.5, '9487', null, undefined, true, {}, [], NaN, Infinity, -Infinity]) {
+    await assert.rejects(rewards.reportOutcome(user, outcome({ elapsed_ms: elapsedMs })),
+      { code: 'INVALID_AD_OUTCOME', status: 400 });
+  }
+  assert.equal(limiterCalls, 0);
+  assert.equal(db.calls.length, 0);
+  assert.equal(db.events.length, 0);
+  assert.equal(logs.length, 0);
+});
+
 test('null attempts are restricted to validated load/start failures; stage and code pairs are enforced', async () => {
   const db = database(), rewards = service(db);
   await rewards.reportOutcome(user, outcome({ attempt_id: null, stage: 'sdk_load', error_code: 'SDK_LOAD_TIMEOUT' }));
