@@ -11,7 +11,8 @@ const { applyBalanceChange, applyBalanceChangeTx } = require("./lib/ledger");
 const { enqueueJob } = require("./lib/jobs");
 const { ensureIdempotencyKeyTx, completeIdempotencyKeyTx } = require("./lib/idempotency");
 const powerups = require("./lib/powerups");
-const { loadConfig } = require("./lib/config");
+// Existing clients request this envelope on startup. Gameplay values come from authenticated state.
+const publicClientConfig = Object.freeze({});
 const { createMonetagRewards } = require("./lib/monetagRewards");
 const { createProgression } = require("./lib/progression");
 const {dailyRewardBreakdown,restorePolicy,STREAK_ECONOMY} = require("./lib/streakPolicy");
@@ -619,7 +620,7 @@ for(const [path,service] of [["/api/admin/stars/refund",starsShop],["/api/admin/
 app.use(cohortMiddleware({env:process.env,verifyTelegramInitData}));
 // Optional single-account ad test; all other requests still reach maintenance.
 app.use(createRecoveryTestAccess({ env: process.env, pool, withTransaction, pilot:weeklyRace,
-  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards }));
+  applyBalanceChangeTx, verifyTelegramInitData, buildClientState, loadConfig: () => publicClientConfig, getEnergyCap, gameplay, vipPass, dailyCheckin: handleDailyCheckin, starsShop, streakRestore, progression, streakRewards, invite, referralCredit, leaderboards }));
 
 // Global maintenance-mode guard for mutating endpoints.
 app.use((req, res, next) => {
@@ -701,14 +702,8 @@ for (const path of ["/api/boost/double", "/api/boost/energy"]) {
 
 // ------------ App config (feature flags, tuning) ------------
 // Frontend uses this to read app_settings so we can tune behaviour without redeploying.
-app.post("/api/config", async (_req, res) => {
-  try {
-    const config = await loadConfig();
-    return res.json({ ok: true, config });
-  } catch (err) {
-    console.error("Error in /api/config", err);
-    return res.status(500).json({ ok: false, error: "CONFIG_LOAD_FAILED" });
-  }
+app.post("/api/config", (_req, res) => {
+  res.json({ ok: true, config: publicClientConfig });
 });
 
 // ------------ Season meta (lightweight) ------------
@@ -2043,37 +2038,6 @@ async function getGlobalRankForUser(user) { return leaderboards.rank(user); }
 async function buildClientState(user, { readOnly = false } = {}) {
   const inviteLink = `https://t.me/${BOT_USERNAME}?startapp=ref_${user.telegram_id}`;
 
-  const { rank, total, balance: rankedBalance } = await getGlobalRankForUser(user);
-  // This balance and position came from the same database snapshot. A reward
-  // committed between the initial account read and ranking cannot mix versions.
-  if (Number.isFinite(rankedBalance)) user = { ...user, balance: rankedBalance };
-
-  let doubleBoostActive = false;
-  let doubleBoostUntil = null;
-
-  if (user.double_boost_until) {
-    const until = new Date(user.double_boost_until);
-    if (!isNaN(until)) {
-      doubleBoostUntil = until.toISOString();
-      doubleBoostActive = until > new Date();
-    }
-  }
-
-  // Starter Bundle offer visibility (purely backend-driven)
-  let starterOfferAvailable = false;
-  let starterOfferExpiresAt = null;
-
-  if (user.starter_offer_expires_at) {
-    const starterExpires = new Date(user.starter_offer_expires_at);
-    if (!isNaN(starterExpires)) {
-      starterOfferExpiresAt = starterExpires.toISOString();
-      if (!user.starter_offer_purchased && starterExpires > new Date()) {
-        starterOfferAvailable = true;
-      }
-    }
-  }
-
-  
   // Active / available power-ups (for UI gating and diagnostics)
   // NOTE: this call is defensive and returns [] on any query/shape mismatch.
   const active_powerups = await powerups.getActivePowerupsForUser(pool, user.id);
@@ -2115,9 +2079,41 @@ async function buildClientState(user, { readOnly = false } = {}) {
     // never fail /api/state because of streak break detection
   }
 
+  const onboarding = await journey.status(user);
+  const {rank, total, account, sampledUs} = await getGlobalRankForUser(user);
+  if (!account) throw Object.assign(Error('USER_NOT_FOUND'), {status:404});
+  user = {...user, ...account};
+  const sampledAt = new Date(Math.floor(sampledUs / 1000));
+
+  let doubleBoostActive = false;
+  let doubleBoostUntil = null;
+
+  if (user.double_boost_until) {
+    const until = new Date(user.double_boost_until);
+    if (!isNaN(until)) {
+      doubleBoostUntil = until.toISOString();
+      doubleBoostActive = until > sampledAt;
+    }
+  }
+
+  // Starter Bundle offer visibility (purely backend-driven)
+  let starterOfferAvailable = false;
+  let starterOfferExpiresAt = null;
+
+  if (user.starter_offer_expires_at) {
+    const starterExpires = new Date(user.starter_offer_expires_at);
+    if (!isNaN(starterExpires)) {
+      starterOfferExpiresAt = starterExpires.toISOString();
+      if (!user.starter_offer_purchased && starterExpires > sampledAt) {
+        starterOfferAvailable = true;
+      }
+    }
+  }
+
+
   // Streak meta + effective caps (server source of truth)
-  const streak_meta = getStreakMetaFromUser(user);
-  const max_energy_effective = getEffectiveMaxEnergy(user, streak_meta);
+  const streak_meta = getStreakMetaFromUser(user, sampledAt.getTime());
+  const max_energy_effective = getEffectiveMaxEnergy(user, streak_meta, sampledAt.getTime());
 
   // Convenience fields for UI (Momentum Shield)
   let momentum_shield_qty = 0;
@@ -2137,8 +2133,7 @@ async function buildClientState(user, { readOnly = false } = {}) {
   return {
     ok: true,
     balance: Number(user.balance || 0),
-    energy: Number(user.energy || 0),
-    today: Number(user.today_farmed || 0),
+    ...gameplay.clientEnergy(user, sampledAt, sampledUs),
     invite_link: inviteLink,
     referrals_count: Number(user.referrals_count || 0),
     referrals_points: Number(user.referrals_points || 0),
@@ -2146,9 +2141,9 @@ async function buildClientState(user, { readOnly = false } = {}) {
     global_total: total,
     double_boost_active: doubleBoostActive,
     double_boost_until: doubleBoostUntil,
-    vip_active: vipBenefits(user,streak_meta).active,
-    vip_benefits: vipBenefits(user,streak_meta),
-    tap_rate: vipBenefits(user,streak_meta).tap,
+    vip_active: vipBenefits(user,streak_meta,sampledAt.getTime()).active,
+    vip_benefits: vipBenefits(user,streak_meta,sampledAt.getTime()),
+    tap_rate: vipBenefits(user,streak_meta,sampledAt.getTime()).tap,
     vip_until: user.vip_until ? new Date(user.vip_until).toISOString() : null,
     vip_tier: Number(user.vip_tier || 0),
     streak_count: Number(user.streak_count || 0),
@@ -2162,7 +2157,7 @@ async function buildClientState(user, { readOnly = false } = {}) {
     momentum_shield_qty,
     momentum_shield_expires_at,
     onboarding_required: user.has_completed_onboarding !== true,
-    onboarding: await journey.status(user),
+    onboarding,
   };
 }
 
@@ -2680,41 +2675,25 @@ app.post("/api/onboarding/complete", starsShop.handler(async req=> {
   return buildClientState(await journey.complete(user));
 }));
 app.get("/api/state-debug", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (!requireAdmin(req, res)) return;
+  const telegramId = String(req.query.telegram_id || "");
+  if (!/^[1-9]\d{0,15}$/.test(telegramId) || !Number.isSafeInteger(Number(telegramId))) {
+    return res.status(400).json({ ok: false, error: "INVALID_TELEGRAM_ID" });
+  }
   try {
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-
-    res.write("STATE-DEBUG ROUTE REACHED\n");
-    res.write(
-      "query.telegram_id = " + (req.query.telegram_id || "NONE") + "\n\n"
-    );
-
-    if (!req.query.telegram_id) {
-      res.write("ERROR: MISSING_TELEGRAM_ID\n");
-      return res.end();
-    }
-
-    req.body = req.body || {};
-    req.body.telegram_id = Number(req.query.telegram_id);
-
-    res.write("Fetching user from DB...\n");
-    let user = await getOrCreateUserFromInitData(req);
-    res.write("User row:\n" + JSON.stringify(user, null, 2) + "\n\n");
-
-    res.write("Applying energy regeneration...\n");
-    user = await applyEnergyRegen(user);
-
-    res.write("Ensuring daily reset...\n");
-    user = await ensureDailyReset(user);
-
-    const state = await buildClientState(user);
-    res.write("Final client state:\n" + JSON.stringify(state, null, 2) + "\n");
-
-    return res.end();
-  } catch (err) {
-    console.error("Error /api/state-debug:", err);
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.write("ERROR IN /api/state-debug:\n" + String(err) + "\n");
-    return res.end();
+    const {rows} = await pool.query(`
+      SELECT balance, energy, max_energy, today_farmed, taps_today, last_reset,
+             last_energy_ts, last_checkin_at, last_checkin_date, streak_count,
+             vip_until, clock_timestamp() AS db_now
+      FROM public.users WHERE telegram_id=$1`, [telegramId]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: "ACCOUNT_NOT_FOUND" });
+    const snapshot = rows[0];
+    const projected = gameplay.project(snapshot, snapshot.db_now);
+    return res.json({ ok: true, balance: Number(snapshot.balance), energy: projected.energy,
+      today: Number(projected.today_farmed), taps_today: Number(projected.taps_today) });
+  } catch (_) {
+    return res.status(503).json({ ok: false, error: "STATE_UNAVAILABLE" });
   }
 });
 

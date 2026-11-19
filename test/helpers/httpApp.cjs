@@ -26,15 +26,21 @@ async function startIsolatedApp(t, maintenance, options = {}) {
     "./lib/gameplay": require("../../lib/gameplay"),
     "./lib/monetagRewards": require("../../lib/monetagRewards"),
     "./lib/recoveryTestAccess": require("../../lib/recoveryTestAccess"),
-    "./lib/starsShop": {createStarsShop:()=>options.starsService||({webhook:(_q,r)=>r.status(401).json({ok:false})}),telegramClient:()=>async()=>{throw Error("Unexpected Stars network");}},
+    "./lib/starsShop": {createStarsShop: args => options.starsService || require("../../lib/starsShop").createStarsShop(args),telegramClient:()=>async()=>{throw Error("Unexpected Stars network");}},
     "./lib/config": { async loadConfig() { configReads++; return {}; } },
     crypto: require("node:crypto"),
     stripe: class { constructor() { throw Error("Unexpected payment client"); } },
     "node-fetch": async () => { throw Error("Unexpected external request"); },
   };
-  vm.runInNewContext(fs.readFileSync(path.join(root, "index.js"), "utf8"), {
+  const source = fs.readFileSync(path.join(root, "index.js"), "utf8");
+  const entry = source.lastIndexOf("start().catch(");
+  if (entry < 0) throw Error("Unknown server boot sequence");
+  vm.runInNewContext(source.slice(0, entry), {
     require(name) {
-      if (!Object.hasOwn(dependencies, name)) throw Error(`Unexpected import: ${name}`);
+      if (!Object.hasOwn(dependencies, name)) {
+        if (/^\.\/lib\/[a-zA-Z]+$/.test(name)) return require(path.join(root, name));
+        throw Error(`Unexpected import: ${name}`);
+      }
       return dependencies[name];
     },
     process: {

@@ -4,13 +4,19 @@ const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('n
 const {createStarsShop}=require('../lib/starsShop');
 const {applyBalanceChangeTx}=require('../lib/ledger');
 let PGlite;try{({PGlite}=require(process.env.JIGCOIN_PGLITE_PATH||'@electric-sql/pglite'));}catch(_){}
-const run=PGlite?test:test.skip;
+const port=Number(process.env.JIGCOIN_TEST_POSTGRES_PORT || 0);
+const run=port || PGlite ? test : test.skip;
 let db,pool,user,service,env,calls,brokenLedger,network,clock;
-const wrap=conn=>({query:async(s,a)=>{const r=await conn.query(s,a);return {...r,rowCount:r.affectedRows??r.rows.length};}});
+const wrap=conn=>({query:async(s,a)=>{const r=await conn.query(s,a);return {...r,rowCount:r.rowCount??r.affectedRows??r.rows.length};}});
 before(async()=>{
- if(!PGlite)return;
- db=new PGlite();pool=wrap(db);
- await db.exec(`CREATE ROLE anon;CREATE ROLE authenticated;CREATE ROLE service_role BYPASSRLS;
+ if(!port && !PGlite)return;
+ db=port ? await require("./helpers/localStarsDb.cjs")(port) : new PGlite();pool=wrap(db);
+ await db.exec(`DO $$ BEGIN
+ PERFORM pg_advisory_xact_lock(14142025);
+ IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon; END IF;
+ IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated; END IF;
+ IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role; END IF;
+ END $$;
  CREATE TABLE public.users(id bigint PRIMARY KEY,telegram_id bigint,balance bigint NOT NULL DEFAULT 0);
  CREATE TABLE public.user_balance_ledger(id bigserial PRIMARY KEY,user_id bigint,delta bigint,reason text,ref_type text,ref_id bigint,event_type text);`);
  const sql=fs.readFileSync(path.join(__dirname,'../sql/migrations/010_stars_shop.sql'),'utf8');
@@ -19,7 +25,7 @@ before(async()=>{
 after(async()=>{if(db)await db.close();});
 beforeEach(async()=>{
  if(!db)return;
- await db.exec('TRUNCATE jigcoin_internal.stars_orders,jigcoin_internal.stars_offers,public.user_balance_ledger,public.users RESTART IDENTITY CASCADE;');
+ await db.exec('TRUNCATE jigcoin_internal.stars_orders,jigcoin_internal.stars_offers,jigcoin_internal.stars_shop_visitors,public.user_balance_ledger,public.users RESTART IDENTITY CASCADE;');
  await pool.query('INSERT INTO public.users(id,telegram_id,balance) VALUES(1,10001,12000),(2,10002,0)');
  user={id:1,telegram_id:10001};calls=[];brokenLedger=false;network=false;clock=Date.now();
  env={STARS_SHOP_ENABLED:'1',RECOVERY_TEST_ENABLED:'1',RECOVERY_TEST_TELEGRAM_ID:'10001',TELEGRAM_WEBHOOK_SECRET:'a'.repeat(48),PAYMENT_SUPPORT_CONTACT:'support@example.test',STARS_WEBHOOK_URL:'https://example.test/telegram/stars-webhook'};
@@ -31,8 +37,20 @@ async function order(sku='JC_SMALL'){await service.catalog(user);return service.
 const query=(o,patch={})=>({id:'query-'+o.order_id,from:{id:10001},invoice_payload:o.order_id,currency:'XTR',total_amount:100,...patch});
 const receipt=(o,patch={})=>({from:{id:10001},successful_payment:{invoice_payload:o.order_id,currency:'XTR',total_amount:100,telegram_payment_charge_id:'charge-'+o.order_id,...patch}});
 async function counts(){return {balance:Number((await pool.query('SELECT balance FROM public.users WHERE id=1')).rows[0].balance),ledger:(await pool.query('SELECT * FROM public.user_balance_ledger')).rows.length};}
-run('preview has three packs and starter, no rolling offer timer until sales enabled',async()=>{env.STARS_SHOP_ENABLED='0';const c=await service.catalog(user);assert.equal(c.products.length,4);assert.equal(c.enabled,false);assert.equal(c.offer_expires_at,null);await assert.rejects(service.invoice(user,'JC_SMALL'),{code:'SHOP_NOT_READY'});});
-run('catalogue offer deadline is persistent across visits; expiry never resets',async()=>{const a=await service.catalog(user),b=await service.catalog(user);assert.equal(a.offer_expires_at,b.offer_expires_at);clock=Date.parse(a.offer_expires_at)+1;const c=await service.catalog(user);assert.equal(c.products.some(p=>p.starter),false);await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'OFFER_EXPIRED'});});
+run('catalogue previews only active, permanent coin packs and starts no deadline',async()=>{
+ env.STARS_SHOP_ENABLED='0';
+ const c=await service.catalog(user,{preview:true});
+ assert.deepEqual(c.products.map(p=>p.sku),['JC_SMALL','JC_MEDIUM','JC_LARGE']);
+ assert.equal(c.enabled,false);
+ assert.equal(c.offer_expires_at,null);
+ await assert.rejects(service.invoice(user,'JC_SMALL'),{code:'SHOP_NOT_READY'});
+});
+run('repeat shop visits create no legacy starter offer',async()=>{
+ await service.catalog(user);clock+=86400000;
+ assert.equal((await service.catalog(user)).offer_expires_at,null);
+ assert.equal((await pool.query('SELECT * FROM jigcoin_internal.stars_offers')).rows.length,0);
+ await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'PRODUCT_UNAVAILABLE'});
+});
 run('server prices and quantities form an XTR invoice; retry reuses order',async()=>{const a=await order(),b=await service.invoice(user,'JC_SMALL');assert.equal(a.order_id,b.order_id);const create=calls.find(c=>c.method==='createInvoiceLink');assert.equal(create.body.currency,'XTR');assert.equal(create.body.prices[0].amount,100);assert.equal((await counts()).ledger,0);});
 run('wrong buyer, price, currency and expired invoice fail precheckout',async()=>{const o=await order();for(const patch of [{from:{id:10002}},{total_amount:1},{currency:'GBP'}]){await service.precheckout(query(o,patch));assert.equal(calls.at(-1).body.ok,false);}clock+=16*60000;await service.precheckout(query(o));assert.equal(calls.at(-1).body.ok,false);assert.equal((await counts()).ledger,0);});
 run('precheckout approves once; same query retries but different query cannot charge twice',async()=>{const o=await order();await service.precheckout(query(o));assert.equal(calls.at(-1).body.ok,true);await service.precheckout(query(o));assert.equal(calls.at(-1).body.ok,true);await service.precheckout(query(o,{id:'second'}));assert.equal(calls.at(-1).body.ok,false);});
@@ -41,7 +59,15 @@ run('parallel receipt delivery is serialized and does not double credit',async()
 run('ledger failure rolls back balance, receipt state and ledger; retry succeeds',async()=>{const o=await order();await service.precheckout(query(o));brokenLedger=true;await assert.rejects(service.settlement(receipt(o)));assert.deepEqual(await counts(),{balance:12000,ledger:0});assert.equal((await service.status(user,o.order_id)).order.status,'approved');brokenLedger=false;await service.settlement(receipt(o));assert.equal((await counts()).ledger,1);});
 run('unapproved or mismatched successful payment cannot grant coins',async()=>{const o=await order();await assert.rejects(service.settlement(receipt(o)),{code:'PAYMENT_NOT_APPROVED'});await service.precheckout(query(o));await assert.rejects(service.settlement(receipt(o,{total_amount:101})),{code:'PAYMENT_MISMATCH'});assert.equal((await counts()).ledger,0);});
 run('charge id cannot be reused on another order; transaction rolls back',async()=>{const a=await order();await service.precheckout(query(a));await service.settlement(receipt(a));const b=await order();await service.precheckout(query(b));await assert.rejects(service.settlement(receipt(b,{telegram_payment_charge_id:'charge-'+a.order_id})));assert.deepEqual(await counts(),{balance:13000,ledger:1});});
-run('starter can be purchased once and cannot be repurchased after refund',async()=>{const o=await order('JC_STARTER');await service.precheckout(query(o,{total_amount:50}));await service.settlement(receipt(o,{total_amount:50}));await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'OFFER_ALREADY_USED'});await service.refundOrder(o.order_id);await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'OFFER_ALREADY_USED'});assert.deepEqual(await counts(),{balance:12000,ledger:2});});
+run('a previously approved starter purchase can still settle and refund once',async()=>{
+ const id='a'.repeat(48);
+ await pool.query(`INSERT INTO jigcoin_internal.stars_orders(user_id,telegram_id,sku,title,coins,stars,starter,payload,status,precheckout_id,expires_at)
+ VALUES(1,10001,'JC_STARTER','Starter offer',1000,50,true,$1,'approved','old-approval',now())`,[id]);
+ await service.settlement(receipt({order_id:id},{total_amount:50}));
+ await service.refundOrder(id);
+ await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'PRODUCT_UNAVAILABLE'});
+ assert.deepEqual(await counts(),{balance:12000,ledger:2});
+});
 run('refund is recorded and reversed once, late successful receipt does not re-credit',async()=>{const o=await order();await service.precheckout(query(o));await service.settlement(receipt(o));await service.refundOrder(o.order_id);await service.refundOrder(o.order_id);await service.settlement(receipt(o));assert.deepEqual(await counts(),{balance:12000,ledger:2});});
 run('refund before success prevents later fulfilment',async()=>{const o=await order();await service.precheckout(query(o));const r=receipt(o);await service.settlement({from:r.from,refunded_payment:r.successful_payment},true);await service.settlement(r);assert.deepEqual(await counts(),{balance:12000,ledger:0});});
 run('spent refund leaves an explicit reconciliation amount, never negative balance',async()=>{const o=await order();await service.precheckout(query(o));await service.settlement(receipt(o));await pool.query('UPDATE public.users SET balance=200 WHERE id=1');await service.refundOrder(o.order_id);assert.equal((await counts()).balance,0);assert.equal(Number((await pool.query('SELECT unrecovered_coins FROM jigcoin_internal.stars_orders')).rows[0].unrecovered_coins),800);await assert.rejects(service.invoice(user,'JC_SMALL'),{code:'PAYMENT_SUPPORT_REQUIRED'});});
