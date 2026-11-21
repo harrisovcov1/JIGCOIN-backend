@@ -705,6 +705,7 @@ app.post('/api/stars/catalog',starsShop.handler(async req=>starsShop.catalog(awa
 app.post('/api/stars/catalog-preview',starsShop.handler(async req=>starsShop.catalog(await getOrCreateUserFromInitData(req),{preview:true})));
 app.post('/api/stars/invoice',starsShop.handler(async req=>starsShop.invoice(await getOrCreateUserFromInitData(req),req.body.sku)));
 app.post('/api/stars/status',starsShop.handler(async req=>starsShop.status(await getOrCreateUserFromInitData(req),req.body.order_id)));
+app.post('/api/stars/interaction',starsShop.handler(async req=>starsShop.interaction(await getOrCreateUserFromInitData(req),req.body)));
 // Retire creation of legacy external digital-goods payments; historical receipts remain.
 for(const path of ['/api/payments/create-checkout','/api/shop/coin-packs','/api/shop/momentum-shields'])
  app.post(path,(_req,res)=>res.status(410).json({ok:false,error:'USE_TELEGRAM_STARS',packs:[]}));
