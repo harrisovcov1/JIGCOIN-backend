@@ -21,11 +21,17 @@ before(async()=>{
  CREATE TABLE public.user_balance_ledger(id bigserial PRIMARY KEY,user_id bigint,delta bigint,reason text,ref_type text,ref_id bigint,event_type text);`);
  const sql=fs.readFileSync(path.join(__dirname,'../sql/migrations/010_stars_shop.sql'),'utf8');
  await db.exec(sql);await db.exec(sql);
+ // Shop analytics table is additive and private.
+ await db.exec(`CREATE TABLE jigcoin_internal.shop_funnel_events_v24(
+  id bigserial PRIMARY KEY,user_id bigint NOT NULL REFERENCES public.users(id),
+  event_name text NOT NULL,sku text NOT NULL DEFAULT '',
+  bucket_10m bigint NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(user_id,event_name,sku,bucket_10m));`);
 });
 after(async()=>{if(db)await db.close();});
 beforeEach(async()=>{
  if(!db)return;
- await db.exec('TRUNCATE jigcoin_internal.stars_orders,jigcoin_internal.stars_offers,jigcoin_internal.stars_shop_visitors,public.user_balance_ledger,public.users RESTART IDENTITY CASCADE;');
+ await db.exec('TRUNCATE jigcoin_internal.shop_funnel_events_v24,jigcoin_internal.stars_orders,jigcoin_internal.stars_offers,jigcoin_internal.stars_shop_visitors,public.user_balance_ledger,public.users RESTART IDENTITY CASCADE;');
  await pool.query('INSERT INTO public.users(id,telegram_id,balance) VALUES(1,10001,12000),(2,10002,0)');
  user={id:1,telegram_id:10001};calls=[];brokenLedger=false;network=false;clock=Date.now();
  env={STARS_SHOP_ENABLED:'1',RECOVERY_TEST_ENABLED:'1',RECOVERY_TEST_TELEGRAM_ID:'10001',TELEGRAM_WEBHOOK_SECRET:'a'.repeat(48),PAYMENT_SUPPORT_CONTACT:'support@example.test',STARS_WEBHOOK_URL:'https://example.test/telegram/stars-webhook'};
@@ -45,11 +51,38 @@ run('catalogue previews only active, permanent coin packs and starts no deadline
  assert.equal(c.offer_expires_at,null);
  await assert.rejects(service.invoice(user,'JC_SMALL'),{code:'SHOP_NOT_READY'});
 });
-run('repeat shop visits create no legacy starter offer',async()=>{
- await service.catalog(user);clock+=86400000;
- assert.equal((await service.catalog(user)).offer_expires_at,null);
+run('starter offer is genuine, preview does not initiate it, and returning buyers are ineligible',async()=>{
+ const preview=await service.catalog(user,{preview:true});
+ assert.equal(preview.offer_expires_at,null);
  assert.equal((await pool.query('SELECT * FROM jigcoin_internal.stars_offers')).rows.length,0);
- await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'PRODUCT_UNAVAILABLE'});
+ const first=await service.catalog(user);
+ assert.ok(first.products.some(p=>p.sku==='JC_STARTER'));
+ assert.ok(Date.parse(first.offer_expires_at)>Date.now());
+ const again=await service.catalog(user);
+ assert.equal(again.offer_expires_at,first.offer_expires_at);
+ assert.equal((await pool.query('SELECT * FROM jigcoin_internal.stars_offers')).rows.length,1);
+ await service.invoice(user,'JC_STARTER');
+ const paid=await service.invoice(user,'JC_SMALL');
+ await service.precheckout(query(paid));
+ await service.settlement(receipt(paid));
+ const returning=await service.catalog(user);
+ assert.ok(!returning.products.some(p=>p.sku==='JC_STARTER'));
+ await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'OFFER_ALREADY_USED'});
+});
+run('shop funnel interaction authenticates, validates, and deduplicates by 10-minute period',async()=>{
+ await service.catalog(user);
+ await service.interaction(user,{event:'pack_selected',sku:'JC_SMALL'});
+ await service.interaction(user,{event:'pack_selected',sku:'JC_SMALL'});
+ let rows=(await pool.query('SELECT * FROM jigcoin_internal.shop_funnel_events_v24')).rows;
+ assert.equal(rows.length,1);
+ await assert.rejects(service.interaction(user,{event:'fake',sku:''}),{code:'INVALID_EVENT'});
+ await assert.rejects(service.interaction(user,{event:'pack_selected',sku:'JC_BAD'}),{code:'PRODUCT_UNAVAILABLE'});
+ clock+=600001;
+ await service.interaction(user,{event:'pack_selected',sku:'JC_SMALL'});
+ rows=(await pool.query('SELECT * FROM jigcoin_internal.shop_funnel_events_v24')).rows;
+ assert.equal(rows.length,2);
+ env.STARS_SHOP_ENABLED='0';
+ await assert.rejects(service.interaction(user,{event:'vip_opened'}),{code:'SHOP_NOT_READY'});
 });
 run('server prices and quantities form an XTR invoice; retry reuses order',async()=>{const a=await order(),b=await service.invoice(user,'JC_SMALL');assert.equal(a.order_id,b.order_id);const create=calls.find(c=>c.method==='createInvoiceLink');assert.equal(create.body.currency,'XTR');assert.equal(create.body.prices[0].amount,100);assert.equal((await counts()).ledger,0);});
 run('wrong buyer, price, currency and expired invoice fail precheckout',async()=>{const o=await order();for(const patch of [{from:{id:10002}},{total_amount:1},{currency:'GBP'}]){await service.precheckout(query(o,patch));assert.equal(calls.at(-1).body.ok,false);}clock+=16*60000;await service.precheckout(query(o));assert.equal(calls.at(-1).body.ok,false);assert.equal((await counts()).ledger,0);});
@@ -65,7 +98,7 @@ run('a previously approved starter purchase can still settle and refund once',as
  VALUES(1,10001,'JC_STARTER','Starter offer',1000,50,true,$1,'approved','old-approval',now())`,[id]);
  await service.settlement(receipt({order_id:id},{total_amount:50}));
  await service.refundOrder(id);
- await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'PRODUCT_UNAVAILABLE'});
+ await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'OFFER_EXPIRED'});
  assert.deepEqual(await counts(),{balance:12000,ledger:2});
 });
 run('refund is recorded and reversed once, late successful receipt does not re-credit',async()=>{const o=await order();await service.precheckout(query(o));await service.settlement(receipt(o));await service.refundOrder(o.order_id);await service.refundOrder(o.order_id);await service.settlement(receipt(o));assert.deepEqual(await counts(),{balance:12000,ledger:2});});
