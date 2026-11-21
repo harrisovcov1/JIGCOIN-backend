@@ -42,6 +42,12 @@ before(async()=>{
     IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role; END IF; END $$;`);
   await pool.query(fs.readFileSync(path.join(__dirname,'helpers/referral-fixture.sql'),'utf8'));
   await pool.query(migration);await pool.query(migration);
+  await pool.query(`CREATE TABLE IF NOT EXISTS jigcoin_internal.invite_interactions_v28(
+    id BIGSERIAL PRIMARY KEY,user_id BIGINT REFERENCES public.users(id) ON DELETE CASCADE,
+    event_name TEXT NOT NULL,bucket_10m BIGINT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id,event_name,bucket_10m)
+  )`);
+
 });
 beforeEach(async()=>{
   if(!port)return;
@@ -152,6 +158,33 @@ run('self, malformed, nonexistent and reassigned attribution cannot create a ref
   assert.equal(Number((await pool.query('SELECT count(*) AS n FROM public.referrals')).rows[0].n),0);
   const raced=await newFriend(`ref_${owner.telegram_id}__src_race_123abc`);
   assert.equal(String(raced.referred_by),String(owner.telegram_id));
+});
+run('legacy approved timestamp with no verified credit contract stays on hold, not rewarded',async()=>{
+ const friend=await newFriend('');
+ await pool.query(`INSERT INTO public.referrals
+  (inviter_id,invited_id,inviter_user_id,invitee_user_id,status,credited_at,inviter_reward_points)
+  VALUES($1,$2,$3,$4,'approved',NOW(),500)`,
+  [owner.telegram_id,friend.telegram_id,owner.id,friend.id]);
+ const data=await invite.summary(owner);
+ assert.equal(data.friends_joined,1);
+ assert.equal(data.friends_rewarded,0);
+ assert.equal(data.friends_on_hold,1);
+ assert.equal(data.friend_progress[0].qualification_mode,'legacy_unknown');
+ assert.equal(data.friend_progress[0].status,'on_hold');
+ assert.equal(data.friend_progress[0].rewarded_at,null);
+ assert.equal(data.friend_progress[0].reward_coins,null);
+ assert.equal(await awardCount(),0);
+});
+run('Invite tracking uses authenticated identity, deduplicates and cannot grant rewards',async()=>{
+ await invite.interaction(owner,{event:'share_open'});
+ await invite.interaction(owner,{event:'share_open'});
+ await invite.interaction(owner,{event:'card_open'});
+ let rows=(await pool.query('SELECT * FROM jigcoin_internal.invite_interactions_v28')).rows;
+ assert.equal(rows.length,2);
+ assert.ok(rows.every(row=>Number(row.user_id)===Number(owner.id)));
+ await assert.rejects(invite.interaction(owner,{event:'grant_reward'}),{status:400});
+ await assert.rejects(invite.interaction({...owner,telegram_id:123456},{event:'share_open'}),{status:401});
+ assert.equal(await awardCount(),0);
 });
 run('summary and history are account scoped, stateful, bounded and do not expose friend Telegram IDs',async()=>{
   const joined=await newFriend(),playing=await newFriend(),qualified=await newFriend(),rewarded=await newFriend(),held=await newFriend();
