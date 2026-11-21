@@ -3994,6 +3994,8 @@ app.post("/api/invite/summary", monetagRewards.handler(async req =>
   invite.summary(await getOrCreateUserFromInitData(req))));
 app.post("/api/invite/history", monetagRewards.handler(async req =>
   invite.history(await getOrCreateUserFromInitData(req))));
+app.post("/api/invite/interaction", monetagRewards.handler(async req =>
+  invite.interaction(await getOrCreateUserFromInitData(req),req.body)));
 
 // Referral ladder status
 app.post("/api/referral/status", async (req, res) => {
