@@ -4405,14 +4405,14 @@ bot.start(async (ctx) => {
 
     await ctx.reply(
       user.welcome_bonus_awarded === 1000
-        ? "Welcome to JigCoin! Your 1,000 welcome coins are ready. Open the app and start tapping."
-        : "Welcome back to JigCoin. Open the app, collect your daily reward and keep building your coins.",
+        ? "Welcome to JIGCOIN! Meet Knurl, your mint pangolin. Your 1,000 welcome coins are ready. Tap to earn game coins and unlock your next prestige finish."
+        : "Welcome back to JIGCOIN! Join Knurl and tap towards your next prestige finish, or race for a weekly medal.",
       {
         reply_markup: {
           inline_keyboard: [
             [
               {
-                text: "Open JigCoin",
+                text: "Play JIGCOIN",
                 web_app: {
                   url: "https://jigcoin-frontend.pages.dev",
                 },
