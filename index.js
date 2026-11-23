@@ -4392,6 +4392,8 @@ bot.on('write_access_allowed',ctx=>streakReminder.recordWriteAccess(ctx.message)
 // An ordinary tester can obtain their own ID without an external lookup bot.
 bot.command("id", async ctx=>ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
 
+const recentStartReplies = new Set();
+
 // /start – handle possible referral
 bot.start(async (ctx) => {
   try {
@@ -4403,10 +4405,14 @@ bot.start(async (ctx) => {
     const user = await referralCredit.register(ctx.from, ctx.startPayload);
     await referralCredit.settle(user);
 
-    await ctx.reply(
+    const chatId = ctx.chat.id;
+    if (recentStartReplies.has(chatId)) return;
+    recentStartReplies.add(chatId);
+    try {
+      await ctx.reply(
       user.welcome_bonus_awarded === 1000
-        ? "Welcome to JIGCOIN! Meet Knurl, your mint pangolin. Your 1,000 welcome coins are ready. Tap to earn game coins and unlock your next prestige finish."
-        : "Welcome back to JIGCOIN! Join Knurl and tap towards your next prestige finish, or race for a weekly medal.",
+        ? "Welcome to JIGCOIN! Meet the Mint Golem. Your 1,000 welcome coins are ready. Tap to earn game coins and unlock your next prestige finish."
+        : "Welcome back. Ready to play?",
       {
         reply_markup: {
           inline_keyboard: [
@@ -4421,7 +4427,12 @@ bot.start(async (ctx) => {
           ],
         },
       }
-    );
+      );
+      setTimeout(() => recentStartReplies.delete(chatId), 5000).unref();
+    } catch (error) {
+      recentStartReplies.delete(chatId);
+      throw error;
+    }
   } catch (err) {
     console.error("Error in /start handler:", err);
     await ctx.reply("Something went wrong. Please try again later.");
