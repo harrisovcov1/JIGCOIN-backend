@@ -536,6 +536,8 @@ const referralCredit = createReferralCredit({pool,withTransaction,journey,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
 const invite = createInvite({pool,botUsername:BOT_USERNAME,
   strictActivation:STRICT_REFERRAL_ACTIVATION,minTaps:REFERRAL_ACTIVATION_MIN_TAPS});
+const championshipReminders = require('./lib/championshipReminders').createReminders({withTransaction,callTelegram:telegramClient(process.env)});
+const championship = require('./lib/championshipService').createChampionship({withTransaction, applyBalanceChangeTx});
 const weeklyRace = createWeeklyRace({pool, withTransaction});
 const allowClientOutcome = userId => hit(`reward-outcome:${userId}`, 12, 10 * 60_000);
 const allowClientLifecycle = userId => hit(`reward-observation:${userId}`, 40, 10 * 60_000);
@@ -687,6 +689,9 @@ app.use((req, res, next) => {
 
 // The pilot uses the same signed Telegram identity and maintenance boundary as gameplay.
 for (const [route, action] of Object.entries({
+  '/api/championship/reminder': (user,body) => process.env.CHAMPIONSHIP_V2==='1'?championshipReminders.set(user,body):({active:false}),
+  '/api/championship/status': (user,body) => process.env.CHAMPIONSHIP_V2==='1'?championship.status(user,body):({active:false}),
+  ...Object.fromEntries(['start','answer'].map(method=>['/api/championship/'+method,(user,body)=>process.env.CHAMPIONSHIP_V2==='1'?championship[method](user,body):({active:false})])),
   '/api/pilot/profile': user => weeklyRace.profile(user),
   '/api/pilot/coin': (user, body) => weeklyRace.profile(user, body.equip),
   '/api/weekly/standings': (user, body) => weeklyRace.standings(user, body),
@@ -4505,6 +4510,10 @@ async function start() {
       weeklyRace.kickFinalizer();
       const weeklyTimer=setInterval(()=>weeklyRace.kickFinalizer(),60000);
       weeklyTimer.unref?.();
+      if(process.env.CHAMPIONSHIP_V2==='1'){
+        const tick=()=>championship.maintain(championshipReminders.dispatch).catch(()=>console.error('Championship maintenance unavailable'));
+        tick();setInterval(tick,30000).unref();
+      }
       const deliverReminders=()=>streakReminder.dispatch().catch(()=>console.error('Daily reminder delivery unavailable'));
       deliverReminders();
       const reminderTimer=setInterval(deliverReminders,15000);
