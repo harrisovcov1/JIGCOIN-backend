@@ -1,0 +1,11 @@
+# Owner walkthrough before the first ranked week
+
+The backend and paired frontend add an owner practice selector to Weekly Race while the official championship is off. All 30 named variants use the championship generator, display filtering, server timing and grading. Scores are discarded and have no official competition meaning.
+
+## Release and verification
+
+1. Run the existing coordinated release checks, including database recovery, current commercial switches and deployment rollback. Apply the approved 030 and 031 schema migrations. They supply the account exclusion table. Leave the official activation record empty and CHAMPIONSHIP_V2 off.
+2. Test the paired review commits independently. Run node --test test/ownerPractice.test.js from the backend checkout. The frontend recovery/owner-practice-mobile.py accepts the backend checkout and an output directory. It uses Playwright, Chromium and a local fixture. It never signs into Telegram.
+3. On the approved single-instance API set CHAMPIONSHIP_OWNER_PREVIEW_ID to the verified existing owner's numeric Telegram ID using the secure operator interface. Retain every other setting. Never use a username or a client-supplied ID as the eligibility check. The authenticated request reuses the existing signature and expiry checks plus a read-only database query for the existing unbanned, non-excluded owner.
+4. Reopen the Mini App from the official bot on the established account, open Weekly Race and select a challenge. Verify a five-round result, resume after leaving the menu, verify a normal account retains the existing race if an already authorised ordinary session is available, and compare the owner's balance, official run count, medals and prize ledger before and after. Never enrol a new production player solely for a smoke test.
+5. Remove CHAMPIONSHIP_OWNER_PREVIEW_ID to disable the walkthrough. Restart discards all owner practice state. A run expires after ten minutes. The feature uses a single process and a single owner. Deployment on multiple interchangeable API instances would require a different preview store or session affinity. Official activation also disables the preview routes. Rank, prize settlement and the Monday cutover continue to use their separate procedure.
