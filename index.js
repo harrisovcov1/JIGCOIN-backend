@@ -691,7 +691,7 @@ app.use((req, res, next) => {
 for (const [route, action] of Object.entries({
   '/api/championship/reminder': (user,body) => process.env.CHAMPIONSHIP_V2==='1'?championshipReminders.set(user,body):({active:false}),
   '/api/championship/status': (user,body) => process.env.CHAMPIONSHIP_V2==='1'?championship.status(user,body):({active:false}),
-  ...Object.fromEntries(['start','answer'].map(method=>['/api/championship/'+method,(user,body)=>process.env.CHAMPIONSHIP_V2==='1'?championship[method](user,body):({active:false})])),
+  ...Object.fromEntries(['start','answer','observe','flip'].map(method=>['/api/championship/'+method,(user,body)=>process.env.CHAMPIONSHIP_V2==='1'?championship[method](user,body):({active:false})])),
   '/api/pilot/profile': user => weeklyRace.profile(user),
   '/api/pilot/coin': (user, body) => weeklyRace.profile(user, body.equip),
   '/api/weekly/standings': (user, body) => weeklyRace.standings(user, body),

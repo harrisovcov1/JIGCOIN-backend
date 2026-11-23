@@ -14,10 +14,25 @@ async function main(){
  try{
  assert.equal((await db.query("select to_regclass('public.users') as u")).rows[0].u,null);
  await db.query(fs.readFileSync('test/helpers/referral-fixture.sql','utf8'));
- await db.query("create table jigcoin_internal.legacy_honours_fixture(day date, kind text);insert into jigcoin_internal.legacy_honours_fixture values('2026-01-01','daily gold'),('2026-01-05','weekly gold')");
- await db.query(fs.readFileSync('sql/migrations/030_championship_v2.sql','utf8'));
- await db.query("insert into jigcoin_internal.championship_config values(true,now()-interval '30 days')");
+ await require('./helpers/championshipRollback.cjs').setupLegacy(db);
  await db.query("insert into public.users(telegram_id,balance) select n,1000 from generate_series(1,5) n");
+ await tx(c=>applyBalanceChangeTx(c,{userId:4,delta:137,reason:'historical_gameplay'}));
+ await db.query("INSERT INTO jigcoin_internal.leaderboard_days_v12 VALUES('2020-01-06',now(),1)");
+ await db.query("INSERT INTO jigcoin_internal.leaderboard_awards_v12(day,place,user_id,score,display_name) VALUES('2020-01-06',1,4,42,'Historic')");
+ await db.query("INSERT INTO jigcoin_internal.weekly_finalizations_v16 VALUES('2020-01-06',now(),1,9,'weekly-v14','legacy_import')");
+ await db.query("INSERT INTO jigcoin_internal.weekly_awards_v16(week,user_id,score,place,awarded_at,player_name) VALUES('2020-01-06',4,9,1,now(),'Historic')");
+ const historical=()=>db.query(`SELECT
+ (SELECT jsonb_agg(to_jsonb(d) ORDER BY day,place) FROM jigcoin_internal.leaderboard_awards_v12 d) daily,
+ (SELECT jsonb_agg(to_jsonb(w) ORDER BY week,user_id) FROM jigcoin_internal.weekly_awards_v16 w) weekly,
+ (SELECT jsonb_agg(to_jsonb(l) ORDER BY id) FROM public.user_balance_ledger l) ledger,
+ (SELECT jsonb_agg(jsonb_build_array(id,balance) ORDER BY id) FROM public.users) balances`).then(r=>r.rows);
+ const preMigration=await historical();
+ await db.query(fs.readFileSync('sql/migrations/030_championship_v2.sql','utf8'));
+ await db.query(fs.readFileSync('sql/migrations/031_championship_cutover.sql','utf8'));
+ assert.deepEqual(await historical(),preMigration);
+ console.log('PASS real legacy daily and weekly award fixtures, prior ledger and balances preserved across both migrations');
+ await db.query("insert into jigcoin_internal.championship_config values(true,now()-interval '30 days')");
+
  const u={id:1,telegram_id:1}, service=createChampionship({withTransaction:tx,applyBalanceChangeTx});
  for(const mode of ['ranked','practice']){
   const requests=await Promise.all(Array.from({length:4},()=>service.start(u,{mode,request:randomUUID()})));
@@ -35,8 +50,8 @@ async function main(){
  }
  const status=await service.status(u,{scope:'friends'});assert.deepEqual(status.remaining,{ranked:0,practice:0});
  const {rows:[{week}]}=await db.query("select (date_trunc('week',now() at time zone 'UTC')::date-7)::text as week");
- await db.query(`insert into jigcoin_internal.championship_runs(id,player,day,week,mode,slot,request,variant,board,opened,expires,round,correct,finished)
- select gen_random_uuid(),n,$1,$1,'ranked',1,gen_random_uuid(),0,'{}',now()-interval '8 days',now()-interval '7 days',5,6-n,true from generate_series(1,5) n`,[week]);
+ await db.query(`insert into jigcoin_internal.championship_runs(id,player,day,week,mode,slot,request,variant,board,opened,expires,round,correct,points,finished)
+ select gen_random_uuid(),n,$1,$1,'ranked',1,gen_random_uuid(),0,'{}',now()-interval '8 days',now()-interval '7 days',5,6-n,(6-n)*200,true from generate_series(1,5) n`,[week]);
  await db.query("insert into jigcoin_internal.championship_exclusions values(1,'synthetic duplicate')");
  await db.query("update public.users set banned_until=now()+interval '1 day' where id=5");
  let count=0;const interrupted=createChampionship({withTransaction:tx,applyBalanceChangeTx:async(...args)=>{const r=await applyBalanceChangeTx(...args);if(++count===2)throw Error('synthetic interruption');return r;}});
@@ -58,8 +73,8 @@ async function main(){
  const uncertain=createReminders({withTransaction:tx,callTelegram:async()=>{throw Error('Ambiguous delivery');}});
  await uncertain.set({id:3,telegram_id:3},pref);await uncertain.dispatch();await uncertain.dispatch();
  assert.deepEqual((await db.query('SELECT state FROM jigcoin_internal.championship_deliveries WHERE player=3')).rows,[{state:'uncertain'}]);
- assert.equal((await db.query('select * from jigcoin_internal.legacy_honours_fixture')).rowCount,2);
  await assert.rejects(service.settle('2000-01-03'),/WEEK_NOT_CLOSED/);
+ await require('./helpers/championshipRollback.cjs').rehearseRollback(db,tx);
  const solve=require('./helpers/championshipSolver.cjs');
  const games=require('../lib/championshipGames');
  const covered=new Set();
@@ -74,6 +89,23 @@ async function main(){
    const body={id:run.id,round,actions:solve(board)};
    if(board.crossings||board.reveal||board.hidden)await assert.rejects(service.answer(player,body),/OBSERVE_FIRST/);
    await db.query("UPDATE jigcoin_internal.championship_runs SET opened=opened-interval '1 minute' WHERE id=$1",[run.id]);
+   if(games.observation(board)){
+    await assert.rejects(service.observe({id:2},{id:run.id,round}),/ROUND_CLOSED/);
+    assert.deepEqual(await service.observe(player,{id:run.id,round}),{done:true});
+    assert.ok(!('reveal' in run.board) && !('faces' in run.board) && !('crossings' in run.board));
+   }
+   if(board.hidden){
+    await assert.rejects(service.answer(player,body),/MISMATCHED_FLIPS/);
+    for(const [step,tile] of body.actions.entries()){
+     const q={id:run.id,round,step,tile};
+     const accepted=await service.flip(player,q);
+     assert.deepEqual(await service.flip(player,q),accepted);
+     if(step===0){
+      await assert.rejects(service.flip({id:2},q),/INVALID_FLIP/);
+      await assert.rejects(service.flip(player,{...q,step:1}),/SAME_TILE/);
+     }
+    }
+   }
    run=await service.answer(player,body);
   }
   assert.equal(run.finished,true);assert.equal(run.score,1000);
