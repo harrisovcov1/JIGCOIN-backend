@@ -687,6 +687,10 @@ app.use((req, res, next) => {
 });
 
 
+require('./lib/ownerPractice').installOwnerPractice({
+  app, env: process.env, pool, verifyTelegramInitData, handler: leaderboards.handler
+});
+
 // The pilot uses the same signed Telegram identity and maintenance boundary as gameplay.
 for (const [route, action] of Object.entries({
   '/api/championship/reminder': (user,body) => process.env.CHAMPIONSHIP_V2==='1'?championshipReminders.set(user,body):({active:false}),
