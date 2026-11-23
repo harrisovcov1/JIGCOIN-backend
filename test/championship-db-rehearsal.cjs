@@ -60,6 +60,28 @@ async function main(){
  assert.deepEqual((await db.query('SELECT state FROM jigcoin_internal.championship_deliveries WHERE player=3')).rows,[{state:'uncertain'}]);
  assert.equal((await db.query('select * from jigcoin_internal.legacy_honours_fixture')).rowCount,2);
  await assert.rejects(service.settle('2000-01-03'),/WEEK_NOT_CLOSED/);
+ const solve=require('./helpers/championshipSolver.cjs');
+ const games=require('../lib/championshipGames');
+ const covered=new Set();
+ for(let n=0;n<30;n++){
+  // A seven-day shift moves the rotation by seven. Seven and thirty are coprime.
+  await db.query("UPDATE jigcoin_internal.championship_config SET accepted_at=date_trunc('week',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'-($1::int*7+1)*interval '1 day'",[n]);
+  const player=(await db.query('INSERT INTO public.users(telegram_id) VALUES($1) RETURNING id,telegram_id',[200+n])).rows[0];
+  let run=await service.start(player,{mode:'ranked',request:randomUUID()});
+  covered.add(run.variant);
+  for(let round=0;round<5;round++){
+   const {rows:[{board}]}=await db.query('SELECT board FROM jigcoin_internal.championship_runs WHERE id=$1',[run.id]);
+   const body={id:run.id,round,actions:solve(board)};
+   if(board.crossings||board.reveal||board.hidden)await assert.rejects(service.answer(player,body),/OBSERVE_FIRST/);
+   await db.query("UPDATE jigcoin_internal.championship_runs SET opened=opened-interval '1 minute' WHERE id=$1",[run.id]);
+   run=await service.answer(player,body);
+  }
+  assert.equal(run.finished,true);assert.equal(run.score,1000);
+  const peer=await service.status(player,{scope:'friends'});
+  assert.equal(peer.me.total,1000);assert.equal(peer.rows.length,1);
+  console.log('DB gameplay PASS',run.variant,games.names[run.variant]);
+ }
+ assert.equal(covered.size,30);
  console.log('PASS: additive migration, concurrent/resumed starts, daily limits, answer retries, synthetic payout failure rollback, concurrent settlement, new service instance retry, exclusions, 175000 ledger total, reminders consent/dedup/disable');
  }finally{await db.end();}
 }
