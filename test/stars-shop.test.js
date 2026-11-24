@@ -17,10 +17,12 @@ before(async()=>{
  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN CREATE ROLE authenticated; END IF;
  IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN CREATE ROLE service_role; END IF;
  END $$;
- CREATE TABLE public.users(id bigint PRIMARY KEY,telegram_id bigint,balance bigint NOT NULL DEFAULT 0);
+ CREATE TABLE public.users(id bigint PRIMARY KEY,telegram_id bigint,balance bigint NOT NULL DEFAULT 0,created_at timestamptz NOT NULL DEFAULT now());
  CREATE TABLE public.user_balance_ledger(id bigserial PRIMARY KEY,user_id bigint,delta bigint,reason text,ref_type text,ref_id bigint,event_type text);`);
  const sql=fs.readFileSync(path.join(__dirname,'../sql/migrations/010_stars_shop.sql'),'utf8');
  await db.exec(sql);await db.exec(sql);
+ const welcome=fs.readFileSync(path.join(__dirname,'../sql/migrations/032_maximum_starter_offer.sql'),'utf8');
+ await db.exec(welcome);await db.exec(welcome);
  // Shop analytics table is additive and private.
  await db.exec(`CREATE TABLE jigcoin_internal.shop_funnel_events_v24(
   id bigserial PRIMARY KEY,user_id bigint NOT NULL REFERENCES public.users(id),
@@ -68,6 +70,64 @@ run('starter offer is genuine, preview does not initiate it, and returning buyer
  const returning=await service.catalog(user);
  assert.ok(!returning.products.some(p=>p.sku==='JC_STARTER'));
  await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'OFFER_ALREADY_USED'});
+});
+async function enableMaximumOffer(t){
+ await pool.query("INSERT INTO jigcoin_internal.stars_products(sku,title,coins,stars) VALUES('JC_MAXIMUM','Maximum',700000,35000)");
+ await pool.query("UPDATE jigcoin_internal.stars_products SET active=true WHERE sku='JC_STARTER_MAX'");
+ t.after(async()=>{
+   await pool.query("UPDATE jigcoin_internal.stars_products SET active=false WHERE sku='JC_STARTER_MAX'");
+   await pool.query("DELETE FROM jigcoin_internal.stars_products WHERE sku='JC_MAXIMUM'");
+ });
+}
+run('Maximum welcome quote lasts seven days, credits exactly once and stays used after refund',async t=>{
+ await enableMaximumOffer(t);
+ assert.equal((await service.catalog(user,{preview:true})).offer_expires_at,null);
+ const catalog=await service.catalog(user);
+ const offers=catalog.products.filter(p=>p.starter);
+ assert.deepEqual(offers.map(p=>[p.sku,p.coins,p.stars]),[['JC_STARTER_MAX',700000,17500]]);
+ const interval=await pool.query('SELECT extract(epoch from expires_at-opened_at) AS seconds FROM jigcoin_internal.stars_offers WHERE user_id=1');
+ assert.equal(Number(interval.rows[0].seconds),7*86400);
+ assert.equal((await service.catalog(user)).offer_expires_at,catalog.offer_expires_at);
+ await assert.rejects(service.invoice(user,'JC_STARTER'),{code:'OFFER_EXPIRED'});
+ const o=await service.invoice(user,'JC_STARTER_MAX');
+ assert.equal(calls.at(-1).body.prices[0].amount,17500);
+ assert.equal((await service.invoice(user,'JC_STARTER_MAX')).order_id,o.order_id);
+ await service.precheckout(query(o,{total_amount:35000}));assert.equal(calls.at(-1).body.ok,false);
+ await service.precheckout(query(o,{total_amount:17500}));assert.equal(calls.at(-1).body.ok,true);
+ const payment=receipt(o,{total_amount:17500});
+ await service.settlement(payment);await service.settlement(payment);
+ assert.deepEqual(await counts(),{balance:712000,ledger:1});
+ await service.refundOrder(o.order_id);await service.refundOrder(o.order_id);
+ assert.deepEqual(await counts(),{balance:12000,ledger:2});
+ assert.equal((await service.catalog(user)).products.some(p=>p.starter),false);
+ await assert.rejects(service.invoice(user,'JC_STARTER_MAX'),{code:'OFFER_ALREADY_USED'});
+});
+run('an established player cannot start the new offer and an assigned legacy offer keeps its deadline',async t=>{
+ await enableMaximumOffer(t);
+ await pool.query("UPDATE public.users SET created_at=now()-interval '8 days' WHERE id=1");
+ assert.equal((await service.catalog(user)).offer_expires_at,null);
+ await assert.rejects(service.invoice(user,'JC_STARTER_MAX'),{code:'OFFER_EXPIRED'});
+ const legacy=await pool.query("INSERT INTO jigcoin_internal.stars_offers(user_id,expires_at) VALUES(1,now()+interval '12 hours') RETURNING expires_at");
+ const c=await service.catalog(user);
+ assert.equal(c.offer_expires_at,new Date(legacy.rows[0].expires_at).toISOString());
+ assert.deepEqual(c.products.filter(p=>p.starter).map(p=>[p.sku,p.coins,p.stars]),[['JC_STARTER',1000,50]]);
+ await service.invoice(user,'JC_STARTER');
+ await assert.rejects(service.invoice(user,'JC_STARTER_MAX'),{code:'OFFER_EXPIRED'});
+});
+run('Maximum offer expiry and regular-price changes close the discounted checkout',async t=>{
+ await enableMaximumOffer(t);
+ await pool.query("UPDATE jigcoin_internal.stars_products SET stars=30000 WHERE sku='JC_MAXIMUM'");
+ assert.equal((await service.catalog(user)).offer_expires_at,null);
+ assert.equal((await pool.query('SELECT * FROM jigcoin_internal.stars_offers')).rows.length,0);
+ await pool.query("UPDATE jigcoin_internal.stars_products SET stars=35000 WHERE sku='JC_MAXIMUM'");
+ const c=await service.catalog(user),o=await service.invoice(user,'JC_STARTER_MAX');
+ await pool.query("UPDATE jigcoin_internal.stars_products SET active=false WHERE sku='JC_MAXIMUM'");
+ await service.precheckout(query(o,{total_amount:17500}));assert.equal(calls.at(-1).body.ok,false);
+ await pool.query("UPDATE jigcoin_internal.stars_products SET active=true WHERE sku='JC_MAXIMUM'");
+ clock=Date.parse(c.offer_expires_at);
+ assert.equal((await service.catalog(user)).offer_expires_at,null);
+ await assert.rejects(service.invoice(user,'JC_STARTER_MAX'),{code:'OFFER_EXPIRED'});
+ assert.deepEqual(await counts(),{balance:12000,ledger:0});
 });
 run('shop funnel interaction authenticates, validates, and deduplicates by 10-minute period',async()=>{
  await service.catalog(user);

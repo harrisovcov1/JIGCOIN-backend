@@ -51,7 +51,7 @@ async function main(){
    await tx(async c=>{
     const week=new Date(Date.UTC(2024,0,1)+(id-10001)*7*86400000).toISOString().slice(0,10);
     await c.query('insert into jigcoin_internal.championship_weeks(week) values($1)',[week]);
-    const {ledgerId}=await require('../lib/ledger').applyBalanceChangeTx(c,{userId:user.id,delta:25000,reason:'weekly_championship',eventType:'challenge_reward'});
+    const {ledgerId}=await require('../lib/ledger').applyBalanceChangeTx(c,{userId:user.id,delta:25000,reason:'weekly_championship',refType:'championship_week',refId:Number(week.replaceAll('-','')),eventType:'challenge_reward'});
     await c.query('insert into jigcoin_internal.championship_trophies values($1,3,$2,4400,25000,$3)',[week,user.id,ledgerId]);
    });
    result={initData:signedInitData(id),telegram_id:id,balance:42800};
