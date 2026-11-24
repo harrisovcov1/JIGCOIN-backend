@@ -31,4 +31,4 @@ jobs:
         env:
           USER: postgres
           JIGCOIN_TEST_POSTGRES_PORT: '15432'
-        run: node --test test/referrals-cumulative.test.js test/vault-trophies.test.js test/stars-shop.test.js test/leaderboard-integration.test.js
+        run: node --test --test-concurrency=1 test/referrals-cumulative.test.js test/vault-trophies.test.js test/stars-shop.test.js test/leaderboard-integration.test.js
