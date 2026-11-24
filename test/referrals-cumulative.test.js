@@ -169,6 +169,10 @@ run('legacy approved timestamp with no verified credit contract stays on hold, n
  assert.equal(data.friends_joined,1);
  assert.equal(data.friends_rewarded,0);
  assert.equal(data.friends_on_hold,1);
+ assert.equal(data.friends_legacy_unverified,1);
+ assert.equal(data.friends_ledger_confirmed,0);
+ assert.equal(data.coins_ledger_confirmed,0);
+ assert.equal(data.friend_progress[0].hold_reason,'legacy');
  assert.equal(data.friend_progress[0].qualification_mode,'legacy_unknown');
  assert.equal(data.friend_progress[0].status,'on_hold');
  assert.equal(data.friend_progress[0].rewarded_at,null);
