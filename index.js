@@ -693,6 +693,7 @@ require('./lib/ownerPractice').installOwnerPractice({
 
 // The pilot uses the same signed Telegram identity and maintenance boundary as gameplay.
 for (const [route, action] of Object.entries({
+  '/api/vault/trophies': user => require('./lib/vaultTrophies').createVaultTrophies({pool}).history(user),
   '/api/championship/reminder': (user,body) => process.env.CHAMPIONSHIP_V2==='1'?championshipReminders.set(user,body):({active:false}),
   '/api/championship/status': (user,body) => process.env.CHAMPIONSHIP_V2==='1'?championship.status(user,body):({active:false}),
   ...Object.fromEntries(['start','answer','observe','flip'].map(method=>['/api/championship/'+method,(user,body)=>process.env.CHAMPIONSHIP_V2==='1'?championship[method](user,body):({active:false})])),
