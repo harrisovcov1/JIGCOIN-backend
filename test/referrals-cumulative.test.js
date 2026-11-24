@@ -236,7 +236,7 @@ run('incoming invitation identifies only the actual inviter and tracks personal 
   await service.activate(friend);
   incoming=(await invite.summary(friend)).incoming_referral;
   assert.equal(incoming.status,'rewarded');assert.equal(incoming.reward_coins,500);assert.ok(incoming.rewarded_at);
-  assert.deepEqual(Object.keys(incoming).sort(),['display_name','status','policy_version','qualification_mode',
+  assert.deepEqual(Object.keys(incoming).sort(),['display_name','status','hold_reason','policy_version','qualification_mode',
     'verified_taps','min_taps','joined_at','rewarded_at','reward_coins'].sort());
   assert.equal(Number((await saved(friend.id)).balance),1100); // welcome + taps, no extra friend credit
 });
@@ -264,4 +264,11 @@ run('database constraints reject partial qualification and partial/mispriced awa
   await assert.rejects(pool.query('UPDATE jigcoin_internal.referral_credits_v16 SET awarded_at=clock_timestamp() WHERE invitee_user_id=$1',[friend.id]),{code:'23514'});
   await reach(friend);await service.activate(friend);
   await assert.rejects(pool.query('UPDATE jigcoin_internal.referral_credits_v16 SET inviter_reward=2000 WHERE invitee_user_id=$1',[friend.id]),{code:'23514'});
+});
+
+run('ledger mismatch is not displayed as a verified award and saved account totals are preserved',async()=>{
+ const friend=await newFriend();await reach(friend,100);await service.activate(friend);
+ const initial=await invite.summary(owner);assert.equal(initial.friends_ledger_confirmed,1);assert.equal(initial.coins_ledger_confirmed,500);assert.equal(initial.friends_rewarded,1);
+ await pool.query("UPDATE public.user_balance_ledger SET delta=delta+1 WHERE user_id=$1 AND reason='referral_reward'",[owner.id]);
+ const next=await invite.summary(owner);assert.equal(next.friends_rewarded,initial.friends_rewarded);assert.equal(next.coins_earned,initial.coins_earned);assert.equal(next.friends_ledger_confirmed,0);assert.equal(next.friends_credit_unconfirmed,1);assert.equal(next.friend_progress[0].hold_reason,'credit_unconfirmed');assert.equal(next.friend_progress[0].reward_coins,null);
 });
